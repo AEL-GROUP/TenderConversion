@@ -166,7 +166,7 @@ def compress_single_pdf(input_path: Path, output_path: Path, target_dpi=200, jpe
         doc.close()
 
 
-def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, jpeg_quality=80, max_mb=50.0, skip_copy=False, quiet=False):
+def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, jpeg_quality=80, max_mb=50.0, skip_copy=False, quiet=False, skip_compression=False):
     """Recursively compresses all PDFs found in converted_root.
 
     Only files LARGER than ``max_mb`` are compressed; smaller files are copied
@@ -176,6 +176,10 @@ def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, j
     When ``skip_copy`` is True, under-limit files are NOT copied to the output
     folder — only compressed/chunked files are written. This dramatically speeds
     up runs with many small files on slow filesystems (e.g. WSL shared mounts).
+
+    When ``skip_compression`` is True, NO files are compressed — every file is
+    copied as-is to the output folder. Useful when you only want to validate
+    and chunk without re-encoding.
 
     When ``quiet`` is True, per-file "skipped"/"compressed" lines are
     suppressed and only a summary count is printed at the end.
@@ -189,7 +193,10 @@ def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, j
         return stats
 
     max_bytes = max_mb * 1024 * 1024
-    print(f"  Found {len(pdf_files)} PDF file(s) to process (threshold: {max_mb} MB)...")
+    if skip_compression:
+        print(f"  Found {len(pdf_files)} PDF file(s) to process (--skip-compression: copying all as-is)...")
+    else:
+        print(f"  Found {len(pdf_files)} PDF file(s) to process (threshold: {max_mb} MB)...")
 
     for pdf_path in pdf_files:
         rel_path = pdf_path.relative_to(converted_root)
@@ -197,6 +204,24 @@ def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, j
 
         orig_bytes = pdf_path.stat().st_size
         orig_mb = orig_bytes / (1024 * 1024)
+
+        # When --skip-compression is set, copy every file as-is without re-encoding.
+        if skip_compression:
+            if skip_copy:
+                stats["skipped"] += 1
+                stats["count"] += 1
+                stats["orig_bytes"] += orig_bytes
+                stats["new_bytes"] += orig_bytes
+                continue
+            output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(pdf_path, output_pdf_path)
+            if not quiet:
+                print(f"  \u23ed\ufe0f Skipped (--skip-compression): {rel_path} ({orig_mb:.2f} MB) -> copied as-is")
+            stats["skipped"] += 1
+            stats["count"] += 1
+            stats["orig_bytes"] += orig_bytes
+            stats["new_bytes"] += orig_bytes
+            continue
 
         # Only compress files that exceed the threshold; copy smaller files as-is
         # because re-encoding them can sometimes produce a larger output.
@@ -413,6 +438,9 @@ def _fallback_split_points(num_pages: int, file_size_mb: float, target_mb: float
     """Even page-count-based split into chunks of roughly equal page count."""
     if num_pages <= 1:
         return [0]
+    if target_mb <= 0:
+        # Avoid division by zero: split into one page per chunk.
+        return list(range(0, num_pages))
     est_chunks = max(2, int(file_size_mb / target_mb) + 1)
     pages_per_chunk = max(1, num_pages // est_chunks)
     points = list(range(0, num_pages, pages_per_chunk))
@@ -728,6 +756,7 @@ def run_tender_pipeline(
     no_chunk: bool = False,
     skip_copy: bool = False,
     quiet: bool = False,
+    skip_compression: bool = False,
 ):
     source_root = Path(source_folder_path).resolve()
 
@@ -780,10 +809,13 @@ def run_tender_pipeline(
         if raw_pdfs:
             print(f"  \u2022 Synced {len(raw_pdfs)} pre-existing PDF(s) into the conversion workspace.")
 
-    print("\n--- STEP 2: COMPRESSING ALL PDFS ---")
+    if skip_compression:
+        print("\n--- STEP 2: SKIPPED (--skip-compression: copying all PDFs as-is) ---")
+    else:
+        print("\n--- STEP 2: COMPRESSING ALL PDFS ---")
     compress_stats = compress_step(
         converted_root, compressed_root, target_dpi=target_dpi, jpeg_quality=jpeg_quality,
-        max_mb=max_mb, skip_copy=skip_copy, quiet=quiet,
+        max_mb=max_mb, skip_copy=skip_copy, quiet=quiet, skip_compression=skip_compression,
     )
 
     print("\n--- STEP 3: VALIDATING FINAL FILE SIZES ---")
@@ -887,6 +919,10 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true",
                          help="Suppress per-file output (skipped/compressed/PASS lines). "
                               "Show only summary counts instead.")
+    parser.add_argument("--skip-compression", action="store_true",
+                         help="Skip the compression step entirely. All files are copied "
+                              "as-is to the output folder. Only validation and chunking "
+                              "are performed.")
 
     args = parser.parse_args()
 
@@ -901,4 +937,5 @@ if __name__ == "__main__":
         no_chunk=args.no_chunk,
         skip_copy=args.skip_copy,
         quiet=args.quiet,
+        skip_compression=args.skip_compression,
     )

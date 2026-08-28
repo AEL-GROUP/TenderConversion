@@ -1,3 +1,5 @@
+
+
 # Tender Document Pipeline — User Guide
 
 A tool for preparing tender submission documents: converts Word files to PDF,
@@ -6,7 +8,62 @@ files that are still too large.
 
 ---
 
-## Quick Start (Docker — recommended)
+## Before Starting: Filtering Files by Extension (`filter_extensions.py`)
+
+The pipeline is designed for converting .docx and .doc to PDF, following by converting them. You should filter files under a folder and keep only the .doc(x) and .pdf files for the downstream pipeline.
+
+And filter_extensions.py is a companion utility that copies files matching selected extensions while
+preserving the original folder structure. Useful for extracting only the file
+types you need (i.e. just the `.pdf`s, or just the `.doc(x)`s) from a large,
+mixed tender folder before running the downstream pipeline.
+
+### How it works
+
+1. You provide either a **text file** of file paths (one per line) **or** a
+   **directory** to scan recursively.
+2. The script lists every file extension it found and prompts you to pick
+   which ones to keep (comma-separated, with or without the leading dot).
+3. Matching files are copied into the output folder, keeping their relative
+   directory structure intact.
+
+### Command-Line Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f`, `--file-list` | — | Path to a text file containing file paths (one per line). Mutually exclusive with `--input-dir`. |
+| `-d`, `--input-dir` | — | Path to a directory to scan recursively for files. Mutually exclusive with `--file-list`. |
+| `-o`, `--output-dir` | `output_files` | Target folder to copy selected files into. |
+
+### Examples
+
+**Scan a folder and keep only PDFs:**
+
+```powershell
+python filter_extensions.py -d /data/MyTender -o /data/MyTender_PDFs
+# At the prompt, type: pdf
+```
+
+**Keep Word documents from a folder:**
+
+```powershell
+python filter_extensions.py -d /data/MyTender -o /data/MyTender_Docs
+# At the prompt, type: docx, doc
+```
+
+**Filter from a pre-made file list:**
+
+```powershell
+python filter_extensions.py -f /data/file_list.txt -o /data/Selected
+# At the prompt, type: .pdf, .dwg
+```
+
+> **Tip:** Run `filter_extensions.py` first to pull out only the file types
+> you need, then point `pdf_tender_pipeline.py` at the filtered output with
+> `--pdf-only` to compress and chunk them.
+
+---
+
+## Downstream Pipeline Quick Start (Docker — recommended)
 
 ### 1. Put your files in the `data` folder
 
@@ -100,6 +157,16 @@ flagged but not split:
 docker compose run --rm tender-pipeline -i /data/MyTender --no-chunk -o /data/MyTender_Final
 ```
 
+### I want to skip compression (just validate and chunk)
+
+Add `--skip-compression` to copy all files as-is without re-encoding. Only
+validation and chunking are performed — useful when your PDFs are already
+optimized and you just need to split over-limit files:
+
+```powershell
+docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --skip-compression --silent -o /data/MyTender_Final
+```
+
 ---
 
 ## All Command-Line Flags
@@ -115,6 +182,7 @@ docker compose run --rm tender-pipeline -i /data/MyTender --no-chunk -o /data/My
 | `--silent` | off | Auto-proceed chunking without prompting. Use for automation/CI. |
 | `--no-chunk` | off | Disable chunking entirely. Over-limit files are flagged but not split. |
 | `--skip-copy` | off | Don't copy under-limit files to the output folder. Only compressed/chunked files are written. Much faster on slow filesystems. |
+| `--skip-compression` | off | Skip the compression step entirely. All files are copied as-is. Only validation and chunking are performed. |
 | `--quiet` | off | Suppress per-file output. Show only summary counts. |
 
 ---
@@ -246,59 +314,6 @@ docker compose run --rm tender-pipeline `
     -o /data/MyTender_Final `
     --no-chunk
 ```
-
----
-
-## Filtering Files by Extension (`filter_extensions.py`)
-
-A companion utility that copies files matching selected extensions while
-preserving the original folder structure. Useful for extracting only the file
-types you need (e.g. just the `.pdf`s, or just the `.docx`s) from a large,
-mixed tender folder before running the pipeline.
-
-### How it works
-
-1. You provide either a **text file** of file paths (one per line) **or** a
-   **directory** to scan recursively.
-2. The script lists every file extension it found and prompts you to pick
-   which ones to keep (comma-separated, with or without the leading dot).
-3. Matching files are copied into the output folder, keeping their relative
-   directory structure intact.
-
-### Command-Line Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-f`, `--file-list` | — | Path to a text file containing file paths (one per line). Mutually exclusive with `--input-dir`. |
-| `-d`, `--input-dir` | — | Path to a directory to scan recursively for files. Mutually exclusive with `--file-list`. |
-| `-o`, `--output-dir` | `output_files` | Target folder to copy selected files into. |
-
-### Examples
-
-**Scan a folder and keep only PDFs:**
-
-```powershell
-python filter_extensions.py -d /data/MyTender -o /data/MyTender_PDFs
-# At the prompt, type: pdf
-```
-
-**Keep Word documents from a folder:**
-
-```powershell
-python filter_extensions.py -d /data/MyTender -o /data/MyTender_Docs
-# At the prompt, type: docx, doc
-```
-
-**Filter from a pre-made file list:**
-
-```powershell
-python filter_extensions.py -f /data/file_list.txt -o /data/Selected
-# At the prompt, type: .pdf, .dwg
-```
-
-> **Tip:** Run `filter_extensions.py` first to pull out only the file types
-> you need, then point `pdf_tender_pipeline.py` at the filtered output with
-> `--pdf-only` to compress and chunk them.
 
 ---
 
