@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+
+# Data — do not commit tender documents
+data/
+Tender18AI/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

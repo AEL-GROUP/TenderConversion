@@ -1,0 +1,43 @@
+services:
+  tender-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tender-pdf-pipeline:latest
+    container_name: tender-pdf-pipeline
+
+    # --------------------------------------------------------------------
+    # VOLUMES: map host folders into the container.
+    # --------------------------------------------------------------------
+    # Option 1 (default, simplest): everything lives under one mount.
+    #   Put raw files in ./data/my_tender_docs on the host (next to this
+    #   compose file). Using -o with just a NAME (see command below) keeps
+    #   the output inside this same ./data folder on your Windows host.
+    #
+    # Option 2 (separate output destination): uncomment the second line
+    #   below and point it at any Windows folder you want the FINAL output
+    #   to land in directly, e.g. a specific tender-submission folder.
+    #   Docker Desktop understands native Windows paths here directly.
+    volumes:
+      - ./data:/data
+      # - "D:/Tenders/Contract7_Final:/output"   # <-- uncomment + edit path to enable Option 2
+
+    # --------------------------------------------------------------------
+    # COMMAND: default args used by `docker compose up`.
+    # Override any of these per-run instead with `docker compose run`, e.g.:
+    #   docker compose run --rm tender-pipeline -i /data/my_tender_docs -o /data/FinalSubmission
+    #   docker compose run --rm tender-pipeline -i /data/my_tender_docs -o /output   (Option 2 above)
+    # --------------------------------------------------------------------
+    command:
+      - "-i"
+      - "/data/Tender18AI_compressed2/18 AI/P01 - DE202412 MBBR/3.0 Proposal"
+      - "-o"
+      - "/data/test_chunk_output"
+      - "--pdf-only"
+      - "--silent"
+      - "--dpi"
+      - "300"
+      - "-q"
+      - "80"
+      - "--max-mb"
+      - "50.0"
