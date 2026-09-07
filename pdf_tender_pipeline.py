@@ -60,6 +60,38 @@ from PIL import Image
 
 # File extensions LibreOffice will convert to PDF
 WORD_EXTENSIONS = ("*.doc", "*.docx")
+_PIPELINE_TEMP_DIR_MARKERS = ("_compress_", "_chunks_", ".run_", ".backup_")
+
+
+def _is_pipeline_temp_dir_name(name: str) -> bool:
+    """Returns whether a directory belongs to pipeline staging."""
+    return name.startswith(".") and any(
+        marker in name for marker in _PIPELINE_TEMP_DIR_MARKERS
+    )
+
+
+def _discover_pdfs(root: Path) -> list[Path]:
+    """Finds PDFs while pruning pipeline-owned temporary directories."""
+    pdf_files = []
+
+    for current_root, directory_names, file_names in os.walk(root):
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if not _is_pipeline_temp_dir_name(name)
+        ]
+        current_path = Path(current_root)
+        pdf_files.extend(
+            current_path / file_name
+            for file_name in file_names
+            if not file_name.startswith("~$")
+            and Path(file_name).suffix.lower() == ".pdf"
+        )
+
+    return sorted(
+        pdf_files,
+        key=lambda path: path.relative_to(root).as_posix().lower(),
+    )
 
 
 # ==============================================================================
@@ -305,10 +337,7 @@ def compress_step(
 
     stats = {"count": 0, "failed": 0, "orig_bytes": 0, "new_bytes": 0, "skipped": 0}
 
-    pdf_files = sorted(
-        converted_root.rglob("*.pdf"),
-        key=lambda path: path.relative_to(converted_root).as_posix().lower(),
-    )
+    pdf_files = _discover_pdfs(converted_root)
 
     if not pdf_files:
         print("  \u2139\ufe0f No .pdf files found to compress.")
@@ -491,7 +520,7 @@ def validate_step(
     }
 
     if pdf_files is None:
-        pdf_files = list(compressed_root.rglob("*.pdf"))
+        pdf_files = _discover_pdfs(compressed_root)
 
     if not pdf_files:
         print("  \u26a0\ufe0f No compressed PDFs found to validate.")
@@ -646,20 +675,21 @@ def assert_file_count(source_root: Path, compressed_root: Path, pdf_only: bool, 
     PDFs than source documents, so the pass condition becomes actual >= expected.
     """
     if pdf_only:
-        source_files = [f for f in source_root.rglob("*.pdf") if not f.name.startswith("~$")]
+        source_files = _discover_pdfs(source_root)
         expected = len(source_files)
         source_desc = ".pdf"
     else:
         source_files = []
-        for pattern in ("*.doc", "*.docx", "*.pdf"):
+        for pattern in ("*.doc", "*.docx"):
             source_files.extend(f for f in source_root.rglob(pattern) if not f.name.startswith("~$"))
+        source_files.extend(_discover_pdfs(source_root))
         # Deduplicate (a file won't match two patterns, but be safe)
         source_files = sorted(set(source_files))
         expected = len(source_files)
         source_desc = ".doc/.docx/.pdf"
 
     if output_pdfs is None:
-        output_pdfs = [f for f in compressed_root.rglob("*.pdf") if not f.name.startswith("~$")]
+        output_pdfs = _discover_pdfs(compressed_root)
     actual = len(output_pdfs)
 
     print("\n==================================================================")
@@ -1126,7 +1156,7 @@ def run_tender_pipeline(
         print("\n--- STEP 1: CONVERTING WORD DOCS (.doc/.docx) TO PDF ---")
         convert_docx_step(source_root, converted_root)
 
-        raw_pdfs = list(source_root.rglob("*.pdf"))
+        raw_pdfs = _discover_pdfs(source_root)
         for pdf in raw_pdfs:
             rel_path = pdf.relative_to(source_root)
             dest = converted_root / rel_path
@@ -1149,12 +1179,12 @@ def run_tender_pipeline(
     print("\n--- STEP 3: VALIDATING FINAL FILE SIZES ---")
     # Collect the output PDF list once and reuse it for validation + count check
     # (avoids re-walking the output tree two extra times).
-    output_pdfs = [f for f in compressed_root.rglob("*.pdf") if not f.name.startswith("~$")]
+    output_pdfs = _discover_pdfs(compressed_root)
     if skip_copy and not output_pdfs:
         # No files were copied to the output folder (all under limit, skip-copy on).
         # Validate the source files directly instead.
         print("  \u2139\ufe0f --skip-copy: no files in output folder. Validating source files directly.")
-        source_pdfs = [f for f in converted_root.rglob("*.pdf") if not f.name.startswith("~$")]
+        source_pdfs = _discover_pdfs(converted_root)
         passed, validate_stats = validate_step(
             converted_root, max_mb=max_mb, max_pages=max_pages,
             pdf_files=source_pdfs, quiet=quiet,
@@ -1195,7 +1225,7 @@ def run_tender_pipeline(
 
             # Re-validate after chunking.
             print("\n--- STEP 3b: RE-VALIDATING AFTER CHUNKING ---")
-            output_pdfs = [f for f in compressed_root.rglob("*.pdf") if not f.name.startswith("~$")]
+            output_pdfs = _discover_pdfs(compressed_root)
             passed, validate_stats = validate_step(
                 compressed_root, max_mb=max_mb, max_pages=max_pages,
                 pdf_files=output_pdfs, quiet=quiet,
