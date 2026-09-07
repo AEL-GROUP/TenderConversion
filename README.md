@@ -94,10 +94,14 @@ docker compose run --rm tender-pipeline -i /data/MyTender -o /data/MyTender_Fina
 
 That's it. The pipeline will:
 1. Convert all `.doc`/`.docx` files to PDF (via LibreOffice)
-2. Compress all PDFs (grayscale + DPI downsampling)
+2. Losslessly repack oversized PDFs, then downsample only high-DPI images if needed
 3. Validate every PDF is under the size limit (default 50 MB)
 4. Chunk any files still over the limit into smaller PDFs
 5. Write the final output to `/data/MyTender_Final`
+
+Compression preserves color, native text, vector drawings, page geometry, and
+rotation. Completed runs are built in a fresh staging directory and replace the
+previous output only after validation succeeds.
 
 ### 3. Collect your output
 
@@ -175,9 +179,11 @@ docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --skip-comp
 |------|---------|-------------|
 | `-i`, `--input` | `/data/my_tender_docs` | Path to the source folder containing raw tender documents. |
 | `-o`, `--output` | `<source> compressed` | Output folder. A bare name (e.g. `FinalSubmission`) is created next to the source. A path (e.g. `/data/Final`) is used as-is. |
-| `--dpi` | `200` | Target DPI for image downsampling. Lower = smaller files but lower quality. |
+| `--dpi` | `200` | Target DPI for rewritten images. Document AI recommends at least 200 DPI for OCR; 300 DPI generally gives better results. |
+| `--dpi-threshold` | `1.5 x --dpi` | Rewrite only images displayed above this effective DPI. Must be greater than `--dpi`. |
 | `-q`, `--quality` | `80` | JPEG quality (1–100). Lower = smaller files but lower quality. |
 | `--max-mb` | `50.0` | Maximum allowed file size in MB. Files over this are compressed, then chunked if still over. |
+| `--workers` | `2` | Concurrent PDF compression processes. Use `1` for low-memory systems or slow shared mounts. |
 | `--pdf-only` | off | Skip Word-to-PDF conversion. Compress existing PDFs directly. |
 | `--silent` | off | Auto-proceed chunking without prompting. Use for automation/CI. |
 | `--no-chunk` | off | Disable chunking entirely. Over-limit files are flagged but not split. |
@@ -187,19 +193,69 @@ docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --skip-comp
 
 ---
 
+## How Compression Works
+
+Only PDFs at or above `--max-mb` enter compression. Smaller PDFs are copied
+byte-for-byte unless `--skip-copy` is enabled.
+
+1. **Lossless repack** — Unused and duplicate PDF objects are removed, and
+   uncompressed streams and object definitions are compressed with standard
+   Flate compression.
+2. **DPI-aware image rewrite** — If the lossless result is still too large,
+   PyMuPDF rewrites images whose effective displayed DPI exceeds
+   `--dpi-threshold`, reducing them to `--dpi`. Color and grayscale images are
+   both supported, but color is never intentionally converted to grayscale.
+3. **Fidelity validation** — Each candidate must reopen and render while
+   preserving page count, page boxes, rotation, and native extracted text.
+4. **Smallest valid result** — The original, lossless result, and rewritten
+   result are compared. The pipeline publishes only the smallest valid file,
+   so compression cannot make an output larger.
+
+Native text and vector objects are not rasterized during ordinary compression.
+Only the existing oversized single-page rescue can rasterize a complete page.
+
+### Parallel Compression
+
+Oversized PDFs are compressed concurrently using separate worker processes.
+Each worker handles one complete PDF, and receives another queued PDF as soon
+as it finishes. Under-limit files are copied or skipped by the parent process
+and never occupy compression workers.
+
+The default is two workers. PyMuPDF does not support multithreaded processing,
+so the pipeline uses processes and each process opens its own PDF. Increase the
+worker count only after checking Docker memory and disk utilization:
+
+```powershell
+docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --workers 4 -o /data/MyTender_Final
+```
+
+Use `--workers 1` when processing very large scanned PDFs, when memory is
+limited, or when the Windows-backed `/data` mount is the bottleneck. A single
+oversized PDF still uses one worker; parallelism improves throughput when
+multiple oversized PDFs are available.
+
+---
+
 ## How Chunking Works
 
 When a PDF is still over the size limit after compression, the pipeline splits
-it into smaller PDFs using page-count splitting:
+it into smaller PDFs using exact serialized byte sizes:
 
-1. **First pass** — The PDF is split into roughly equal page-count chunks
-   targeting 90% of the size limit (e.g. 45 MB for a 50 MB limit).
+1. **Greedy page packing** — Pages are added in their original order. After
+   each addition, the candidate chunk is serialized in memory using the same
+   settings as the final PDF.
 
-2. **Re-chunking passes** (up to 2) — Any chunk still over the limit is split
-   again with a smaller target (60% of the limit).
+2. **Exact boundary** — When the next page would reach or exceed the limit,
+   the last valid serialized bytes are written directly as the final chunk.
+   Final chunks are therefore written once and are strictly below the limit.
 
-3. **Name flattening** — After all passes, chunk names are cleaned up to a
-   sequential scheme:
+3. **Oversized-page rescue** — If one page cannot fit by itself, only that page
+   is rasterized at progressively lower DPI and JPEG quality until it fits.
+   This can reduce quality and removes searchable text from that page.
+
+4. **Transactional replacement** — Chunks are staged first. The original PDF
+   and any stale chunks are replaced only after every page has a valid output.
+   Names follow the original page order:
    ```
    MyDocument_chunk-1.pdf
    MyDocument_chunk-2.pdf
@@ -231,26 +287,16 @@ the folder structure.
 
 🚨 VALIDATION FAILED: 2 file(s) at/over 50.0 MB!
 
---- STEP 3b: PAGE-COUNT CHUNKING (2 over-limit file(s)) ---
-  📄 Chunking: V3_02 - SCOPE (Drawings) - GENERAL ARRANGEMENT (GA)_Combined.pdf (126.52 MB, 60 pages)
-     Split points (page indices): [0, 20, 40]
-     • Produced: V3_02_..._chunk-1.pdf (36.36 MB)
-     • Produced: V3_02_..._chunk-2.pdf (35.56 MB)
-     • Produced: V3_02_..._chunk-3.pdf (54.35 MB)
-  📄 Chunking: V3_12 - SCOPE (Drawings) - BUILDING SERVICES (BS)_Combined.pdf (60.48 MB, 110 pages)
-     Split points (page indices): [0, 55]
-     • Produced: V3_12_..._chunk-1.pdf (26.41 MB)
-     • Produced: V3_12_..._chunk-2.pdf (33.38 MB)
-
-  🔁 RE-CHUNKING PASS 1: 1 chunk(s) still over limit
-     📄 Re-chunking: V3_02_..._chunk-3.pdf (54.35 MB, 20 pages)
-     Re-split points (page indices): [0, 10]
-     • Produced: V3_02_..._chunk-3_chunk-1a.pdf (24.63 MB)
-     • Produced: V3_02_..._chunk-3_chunk-2a.pdf (29.76 MB)
+--- STEP 3b: EXACT SIZE CHUNKING (2 over-limit file(s)) ---
+  📄 Chunking: V3_02 - SCOPE (Drawings) - GENERAL ARRANGEMENT (GA)_Combined.pdf (126.52 MB)
+     • Produced: V3_02_..._chunk-1.pdf (pp. 1-24, 48.72 MB)
+     • Produced: V3_02_..._chunk-2.pdf (pp. 25-41, 47.91 MB)
+     • Produced: V3_02_..._chunk-3.pdf (pp. 42-60, 29.89 MB)
+  📄 Chunking: V3_12 - SCOPE (Drawings) - BUILDING SERVICES (BS)_Combined.pdf (60.48 MB)
+     • Produced: V3_12_..._chunk-1.pdf (pp. 1-87, 49.26 MB)
+     • Produced: V3_12_..._chunk-2.pdf (pp. 88-110, 11.22 MB)
 
   ✅ All chunks are under 50.0 MB.
-
-  📋 Flattened 2 chunk name(s) to clean sequential scheme.
 
 --- STEP 3b: RE-VALIDATING AFTER CHUNKING ---
   ℹ️ Validated 6 file(s): 6 passed, 0 over limit.
@@ -267,7 +313,8 @@ the folder structure.
   ✅ Passed (< 50.0 MB)     : 6
   ❌ Failed (>= 50.0 MB)    : 0
   Files chunked          : 2
-  Chunks produced        : 6
+   Chunks produced        : 5
+   Oversized pages rescued : 0
   Chunks still over limit : 0
 ==================================================================
 
@@ -326,8 +373,9 @@ docker compose run --rm tender-pipeline `
 
 ### Install dependencies
 
-```bash
-pip install -r requirements.txt
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 ### Run
@@ -353,8 +401,10 @@ docker run --rm -v "${PWD}/data:/data" python:3.12-slim python -c "import shutil
 
 ### Files still over the limit after chunking
 
-If a single-page PDF is over the limit, it cannot be chunked further. The
-pipeline will flag it for manual intervention. Options:
+The pipeline automatically rasterizes an individually oversized page at
+progressively lower DPI and JPEG quality. If the page still cannot fit at the
+lowest fallback setting, the original PDF is preserved and flagged for manual
+intervention. Options:
 - Re-scan the source at a lower DPI
 - Use a lower `--dpi` and `-q` value to compress more aggressively
 - Use a higher `--max-mb` if your submission system allows it

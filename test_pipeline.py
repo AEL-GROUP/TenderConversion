@@ -50,7 +50,7 @@ def make_pdf_with_image(path: Path, num_pages: int = 2, img_size: int = 500):
     doc = pymupdf.open()
     for i in range(num_pages):
         page = doc.new_page(width=612, height=792)
-        # Create a colour image (RGB) so compression can convert to grayscale
+        # Create an RGB image so compression can exercise its color path.
         img = Image.new("RGB", (img_size, img_size), color=(255, 100, 50))
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -62,32 +62,68 @@ def make_pdf_with_image(path: Path, num_pages: int = 2, img_size: int = 500):
     return path
 
 
+def make_pdf_with_color_detail(path: Path, img_size: int = 1200):
+    """Create native text, vector content, and a high-DPI color image."""
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (img_size, img_size), color=(220, 30, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(
+        (img_size // 2, 0, img_size, img_size),
+        fill=(20, 80, 220),
+    )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((20, 25), "COLOR SPECIFICATION")
+    page.draw_rect(pymupdf.Rect(15, 35, 135, 155), color=(0, 0, 0), width=2)
+    page.insert_image(
+        pymupdf.Rect(20, 40, 120, 140),
+        stream=buffer.getvalue(),
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(path, garbage=3, deflate=True)
+    doc.close()
+    return path
+
+
+def make_pdf_with_unique_images(path: Path, num_pages: int = 6, img_size: int = 500):
+    """Create pages with distinct text and incompressible images."""
+    from PIL import Image
+
+    doc = pymupdf.open()
+    for page_number in range(1, num_pages + 1):
+        page = doc.new_page(width=300, height=300)
+        page.insert_text((20, 25), f"PAGE-{page_number}")
+        image = Image.frombytes("L", (img_size, img_size), os.urandom(img_size ** 2))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+        page.insert_image(pymupdf.Rect(20, 40, 280, 280), stream=buffer.getvalue())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(path, garbage=3, deflate=True)
+    doc.close()
+    return path
+
+
 # ------------------------------------------------------------------------------
-# Tests: _fallback_split_points
+# Tests: exact page-range serialization
 # ------------------------------------------------------------------------------
-class TestFallbackSplitPoints:
-    def test_single_page_returns_zero(self):
-        assert pipeline._fallback_split_points(1, 100.0, 50.0) == [0]
+class TestSerializePdfRange:
+    def test_measured_bytes_are_the_written_bytes(self, tmp_path):
+        pdf_path = make_pdf(tmp_path / "doc.pdf", num_pages=4)
+        doc = pymupdf.open(pdf_path)
+        serialized = pipeline._serialize_pdf_range(doc, 1, 3)
+        doc.close()
 
-    def test_zero_pages_returns_zero(self):
-        assert pipeline._fallback_split_points(0, 100.0, 50.0) == [0]
+        output_path = tmp_path / "range.pdf"
+        output_path.write_bytes(serialized)
 
-    def test_two_pages_over_limit(self):
-        points = pipeline._fallback_split_points(2, 100.0, 50.0)
-        assert points[0] == 0
-        assert len(points) >= 2
-
-    def test_many_pages(self):
-        points = pipeline._fallback_split_points(60, 126.0, 45.0)
-        assert points[0] == 0
-        # Should produce at least 3 chunks for 126 MB / 45 MB target
-        assert len(points) >= 3
-        # Last split point should be < 60
-        assert points[-1] < 60
-
-    def test_always_starts_with_zero(self):
-        points = pipeline._fallback_split_points(10, 200.0, 50.0)
-        assert points[0] == 0
+        assert output_path.stat().st_size == len(serialized)
+        range_doc = pymupdf.open(output_path)
+        assert len(range_doc) == 2
+        range_doc.close()
 
 
 # ------------------------------------------------------------------------------
@@ -121,6 +157,67 @@ class TestResolveOutputRoot:
         monkeypatch.chdir(source.parent)
         result = pipeline.resolve_output_root(source, "../Output", "compressed")
         assert result == (source.parent / ".." / "Output").resolve()
+
+
+class TestStagedRunPublication:
+    def test_repeated_run_replaces_stale_output_tree(self, tmp_path):
+        source = tmp_path / "source"
+        output = tmp_path / "final"
+        source.mkdir()
+        make_pdf(source / "document.pdf", num_pages=1)
+
+        pipeline.run_tender_pipeline(
+            str(source),
+            output_folder=str(output),
+            pdf_only=True,
+            silent=True,
+        )
+        stale_file = output / "stale.txt"
+        stale_file.write_text("old run", encoding="utf-8")
+
+        pipeline.run_tender_pipeline(
+            str(source),
+            output_folder=str(output),
+            pdf_only=True,
+            silent=True,
+        )
+
+        assert (output / "document.pdf").exists()
+        assert not stale_file.exists()
+        assert (source / "document.pdf").exists()
+
+    def test_compression_failure_prevents_publication(
+        self, tmp_path, monkeypatch
+    ):
+        source = tmp_path / "source"
+        output = tmp_path / "final"
+        source.mkdir()
+        source_pdf = make_pdf(source / "document.pdf", num_pages=1)
+
+        def failed_compression(_source, compressed_root, **_kwargs):
+            compressed_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_pdf, compressed_root / source_pdf.name)
+            size = source_pdf.stat().st_size
+            return {
+                "count": 1,
+                "failed": 1,
+                "orig_bytes": size,
+                "new_bytes": size,
+                "skipped": 0,
+            }
+
+        monkeypatch.setattr(pipeline, "compress_step", failed_compression)
+
+        with pytest.raises(SystemExit):
+            pipeline.run_tender_pipeline(
+                str(source),
+                output_folder=str(output),
+                pdf_only=True,
+                silent=True,
+                skip_copy=True,
+            )
+
+        assert not output.exists()
 
 
 # ------------------------------------------------------------------------------
@@ -188,6 +285,55 @@ class TestCompressStep:
         assert stats["skipped"] == 0
         assert (out / "big.pdf").exists()
 
+    def test_parallel_workers_compress_independent_pdfs(self, tmp_path):
+        src = tmp_path / "src"
+        out = tmp_path / "out"
+        make_pdf_with_image(src / "first" / "a.pdf", num_pages=1, img_size=500)
+        make_pdf_with_image(src / "second" / "b.pdf", num_pages=1, img_size=500)
+
+        stats = pipeline.compress_step(
+            src,
+            out,
+            max_mb=0.0,
+            target_dpi=72,
+            jpeg_quality=30,
+            workers=2,
+        )
+
+        assert stats["count"] == 2
+        assert stats["failed"] == 0
+        assert (out / "first" / "a.pdf").exists()
+        assert (out / "second" / "b.pdf").exists()
+
+    def test_parallel_worker_failure_does_not_block_valid_pdf(self, tmp_path):
+        src = tmp_path / "src"
+        out = tmp_path / "out"
+        src.mkdir()
+        (src / "broken.pdf").write_bytes(b"not a PDF")
+        make_pdf_with_image(src / "valid.pdf", num_pages=1, img_size=500)
+
+        stats = pipeline.compress_step(
+            src,
+            out,
+            max_mb=0.0,
+            target_dpi=72,
+            jpeg_quality=30,
+            workers=2,
+        )
+
+        assert stats["count"] == 2
+        assert stats["failed"] == 1
+        assert not (out / "broken.pdf").exists()
+        assert (out / "valid.pdf").exists()
+
+    def test_invalid_worker_count_is_rejected(self, tmp_path):
+        src = tmp_path / "src"
+        out = tmp_path / "out"
+        src.mkdir()
+
+        with pytest.raises(ValueError, match="workers"):
+            pipeline.compress_step(src, out, workers=0)
+
     def test_skip_copy_under_limit(self, tmp_path):
         src = tmp_path / "src"
         out = tmp_path / "out"
@@ -226,74 +372,161 @@ class TestCompressStep:
         stats = pipeline.compress_step(src, out, max_mb=50.0)
         assert stats["count"] == 0
 
+    def test_rewrite_preserves_color_text_and_geometry(self, tmp_path):
+        source = make_pdf_with_color_detail(tmp_path / "source.pdf")
+        output = tmp_path / "output.pdf"
 
-# ------------------------------------------------------------------------------
-# Tests: _split_pdf_at_pages
-# ------------------------------------------------------------------------------
-class TestSplitPdfAtPages:
-    def test_split_into_two(self, tmp_path):
-        src = tmp_path / "src"
-        out = tmp_path / "out"
-        src.mkdir()
-        pdf = make_pdf(src / "doc.pdf", num_pages=4)
-        result = pipeline._split_pdf_at_pages(pdf, out, [0, 2], "doc")
-        assert len(result) == 2
-        assert result[0].name == "doc_chunk-1.pdf"
-        assert result[1].name == "doc_chunk-2.pdf"
-        # Verify page counts
-        d1 = pymupdf.open(result[0])
-        assert len(d1) == 2
-        d1.close()
-        d2 = pymupdf.open(result[1])
-        assert len(d2) == 2
-        d2.close()
+        source_doc = pymupdf.open(source)
+        source_page = source_doc[0]
+        source_text = source_page.get_text()
+        source_geometry = (
+            tuple(source_page.mediabox),
+            tuple(source_page.cropbox),
+            source_page.rotation,
+        )
+        source_doc.close()
 
-    def test_split_uneven(self, tmp_path):
-        src = tmp_path / "src"
-        out = tmp_path / "out"
-        src.mkdir()
-        pdf = make_pdf(src / "doc.pdf", num_pages=5)
-        result = pipeline._split_pdf_at_pages(pdf, out, [0, 2, 4], "doc")
-        assert len(result) == 3
-        d1 = pymupdf.open(result[0])
-        assert len(d1) == 2
-        d1.close()
-        d2 = pymupdf.open(result[1])
-        assert len(d2) == 2
-        d2.close()
-        d3 = pymupdf.open(result[2])
-        assert len(d3) == 1
-        d3.close()
+        pipeline.compress_single_pdf(
+            source,
+            output,
+            target_dpi=200,
+            jpeg_quality=80,
+            max_bytes=0,
+        )
+
+        output_doc = pymupdf.open(output)
+        output_page = output_doc[0]
+        assert output_page.get_text() == source_text
+        assert (
+            tuple(output_page.mediabox),
+            tuple(output_page.cropbox),
+            output_page.rotation,
+        ) == source_geometry
+
+        image_info = output_page.get_image_info()
+        assert image_info[0]["width"] < 1200
+        pixmap = output_page.get_pixmap(dpi=72, colorspace=pymupdf.csRGB)
+        red = pixmap.pixel(45, 80)
+        blue = pixmap.pixel(95, 80)
+        assert red[0] > red[2] + 50
+        assert blue[2] > blue[0] + 50
+        output_doc.close()
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"target_dpi": 0}, "target_dpi"),
+            ({"jpeg_quality": 101}, "jpeg_quality"),
+            ({"target_dpi": 200, "dpi_threshold": 200}, "dpi_threshold"),
+        ],
+    )
+    def test_invalid_compression_settings_are_rejected(
+        self, tmp_path, kwargs, message
+    ):
+        source = make_pdf(tmp_path / "source.pdf", num_pages=1)
+        with pytest.raises(ValueError, match=message):
+            pipeline.compress_single_pdf(source, tmp_path / "output.pdf", **kwargs)
+
+    def test_failed_candidate_does_not_replace_existing_output(self, tmp_path, monkeypatch):
+        source = make_pdf_with_color_detail(tmp_path / "source.pdf")
+        output = tmp_path / "output.pdf"
+        output.write_bytes(b"previous successful output")
+
+        def fail_save(*args, **kwargs):
+            raise RuntimeError("injected save failure")
+
+        monkeypatch.setattr(pipeline, "_save_compressed_document", fail_save)
+        with pytest.raises(RuntimeError, match="injected save failure"):
+            pipeline.compress_single_pdf(source, output, max_bytes=0)
+
+        assert output.read_bytes() == b"previous successful output"
 
 
 # ------------------------------------------------------------------------------
 # Tests: chunk_step (integration)
 # ------------------------------------------------------------------------------
 class TestChunkStep:
-    def test_chunk_over_limit_file(self, tmp_path):
+    def test_chunks_once_under_exact_limit_in_page_order(self, tmp_path):
         out = tmp_path / "out"
         out.mkdir()
-        # Create a PDF, then validate with max_mb=0 so it's "over limit"
-        make_pdf(out / "big.pdf", num_pages=6)
-        passed, vstats = pipeline.validate_step(out, max_mb=0.0)
-        assert not passed
-        cstats = pipeline.chunk_step(vstats["overlimit_files"], out, max_mb=50.0)
+        pdf_path = make_pdf_with_unique_images(out / "big.pdf")
+        stale_chunk = out / "big_chunk-99.pdf"
+        stale_chunk.write_bytes(b"stale")
+
+        doc = pymupdf.open(pdf_path)
+        two_page_bytes = len(pipeline._serialize_pdf_range(doc, 0, 2))
+        doc.close()
+        max_bytes = two_page_bytes + 1
+        max_mb = max_bytes / (1024 * 1024)
+
+        cstats = pipeline.chunk_step(
+            [(pdf_path.name, pdf_path.stat().st_size / (1024 * 1024))],
+            out,
+            max_mb=max_mb,
+        )
         assert cstats["chunked"] == 1
         assert cstats["produced"] >= 2
-        # Original should be deleted
         assert not (out / "big.pdf").exists()
-        # Chunks should exist
-        chunks = list(out.glob("big_chunk-*.pdf"))
-        assert len(chunks) >= 2
+        assert not stale_chunk.exists()
 
-    def test_chunk_single_page_fails(self, tmp_path):
+        chunks = sorted(
+            out.glob("big_chunk-*.pdf"),
+            key=lambda path: int(path.stem.rsplit("-", 1)[1]),
+        )
+        assert len(chunks) == cstats["produced"]
+        assert all(chunk.stat().st_size < max_bytes for chunk in chunks)
+
+        page_text = []
+        for chunk in chunks:
+            chunk_doc = pymupdf.open(chunk)
+            page_text.extend(
+                page.get_text().strip().splitlines()[0]
+                for page in chunk_doc
+            )
+            chunk_doc.close()
+        assert page_text == [f"PAGE-{number}" for number in range(1, 7)]
+
+    def test_single_oversized_page_is_rescued(self, tmp_path):
         out = tmp_path / "out"
         out.mkdir()
-        make_pdf(out / "single.pdf", num_pages=1)
-        passed, vstats = pipeline.validate_step(out, max_mb=0.0)
-        cstats = pipeline.chunk_step(vstats["overlimit_files"], out, max_mb=50.0)
+        pdf_path = make_pdf_with_unique_images(
+            out / "single.pdf",
+            num_pages=1,
+            img_size=1000,
+        )
+        max_mb = 0.08
+
+        cstats = pipeline.chunk_step(
+            [(pdf_path.name, pdf_path.stat().st_size / (1024 * 1024))],
+            out,
+            max_mb=max_mb,
+        )
+
+        rescued_chunk = out / "single_chunk-1.pdf"
+        assert cstats["chunked"] == 1
+        assert cstats["rescued_pages"] == 1
+        assert rescued_chunk.stat().st_size < max_mb * 1024 * 1024
+        assert not pdf_path.exists()
+
+    def test_failed_rescue_preserves_original_and_stale_chunks(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        pdf_path = make_pdf_with_unique_images(out / "single.pdf", num_pages=1)
+        original_bytes = pdf_path.read_bytes()
+        stale_chunk = out / "single_chunk-1.pdf"
+        stale_chunk.write_bytes(b"existing chunk")
+
+        cstats = pipeline.chunk_step(
+            [(pdf_path.name, pdf_path.stat().st_size / (1024 * 1024))],
+            out,
+            max_mb=0.0001,
+        )
+
         assert cstats["failed"] == 1
+        assert cstats["still_over"] == 1
         assert cstats["chunked"] == 0
+        assert pdf_path.read_bytes() == original_bytes
+        assert stale_chunk.read_bytes() == b"existing chunk"
 
     def test_no_overlimit_files(self, tmp_path):
         out = tmp_path / "out"

@@ -7,14 +7,15 @@ Steps
 -----
   STEP 1: Convert Word documents (.doc AND .docx) to PDF via LibreOffice.
           (Skipped when --pdf-only is passed; existing PDFs are compressed directly.)
-  STEP 2: Compress every PDF (grayscale + DPI downsampling) via PyMuPDF/Pillow.
+  STEP 2: Losslessly repack PDFs, then downsample oversized images while
+      preserving color via PyMuPDF.
           Files already under the size threshold are copied as-is.
   STEP 3: Validate every compressed PDF is strictly under a size threshold
           (default 50 MB).
   STEP 3b: Chunk any files still over the limit into smaller PDFs using
-          page-count splitting. Re-chunks any chunks that are still over the
-          limit with a letter suffix. Skipped when --no-chunk is passed or the
-          user declines the interactive prompt (unless --silent auto-proceeds).
+      exact serialized byte sizes. Oversized individual pages are
+      adaptively rasterized. Skipped when --no-chunk is passed or the user
+      declines the interactive prompt (unless --silent auto-proceeds).
   STEP 4: Print aggregate summary statistics for the whole run.
   STEP 5: Assert the output file count matches the source document count.
 
@@ -43,11 +44,15 @@ Usage
 """
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+import hashlib
 import io
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pymupdf  # PyMuPDF
@@ -110,63 +115,169 @@ def convert_docx_step(source_root: Path, converted_root: Path):
 # ==============================================================================
 # STEP 2: COMPRESS PDFS
 # ==============================================================================
-def compress_single_pdf(input_path: Path, output_path: Path, target_dpi=200, jpeg_quality=80):
-    """Compresses a single PDF by downsampling and converting images to grayscale."""
-    doc = pymupdf.open(input_path)
-    processed_xrefs = set()
-
-    try:
+def _document_invariants(pdf_path: Path, render_check: bool = False) -> tuple:
+    """Returns semantic and geometric invariants used to reject bad rewrites."""
+    with pymupdf.open(pdf_path) as doc:
+        pages = []
         for page in doc:
-            page_width_in = page.rect.width / 72.0
-            max_width_px = max(1, int(page_width_in * target_dpi))
-
-            for img in page.get_images():
-                xref = img[0]
-                if xref in processed_xrefs or xref == 0:
-                    continue
-                processed_xrefs.add(xref)
-
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
-
-                try:
-                    pil_img = Image.open(io.BytesIO(image_bytes))
-                    pil_img.load()
-                except Exception:
-                    continue
-
-                width, height = pil_img.size
-
-                # Skip re-encoding if the image is already optimized:
-                # small enough, already grayscale, and already JPEG.
-                if (
-                    width <= max_width_px
-                    and pil_img.mode == "L"
-                    and base_image.get("ext", "").lower() == "jpeg"
-                ):
-                    continue
-
-                if width > max_width_px:
-                    scale_factor = max_width_px / float(width)
-                    new_height = max(1, int(float(height) * scale_factor))
-                    pil_img = pil_img.resize(
-                        (max_width_px, new_height), Image.Resampling.LANCZOS
-                    )
-
-                if pil_img.mode != "L":
-                    pil_img = pil_img.convert("L")
-
-                buffer = io.BytesIO()
-                pil_img.save(buffer, format="JPEG", quality=jpeg_quality, optimize=True)
-                page.replace_image(xref, stream=buffer.getvalue())
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(output_path, garbage=3, deflate=True)
-    finally:
-        doc.close()
+            text_hash = hashlib.sha256(page.get_text("text").encode("utf-8")).hexdigest()
+            pages.append((
+                tuple(page.mediabox),
+                tuple(page.cropbox),
+                page.rotation,
+                text_hash,
+            ))
+            if render_check:
+                page.get_pixmap(dpi=36, colorspace=pymupdf.csRGB, alpha=False)
+        return doc.page_count, tuple(pages)
 
 
-def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, jpeg_quality=80, max_mb=50.0, skip_copy=False, quiet=False, skip_compression=False):
+def _valid_compression_candidate(candidate: Path, expected_invariants: tuple) -> bool:
+    """Checks that a staged PDF can be read, rendered, and still exposes its text."""
+    try:
+        return _document_invariants(candidate, render_check=True) == expected_invariants
+    except Exception:
+        return False
+
+
+def _save_compressed_document(doc, output_path: Path) -> None:
+    doc.save(output_path, garbage=4, deflate=1, use_objstms=True)
+
+
+def compress_single_pdf(
+    input_path: Path,
+    output_path: Path,
+    target_dpi=200,
+    jpeg_quality=80,
+    max_bytes: float | None = None,
+    dpi_threshold: int | None = None,
+):
+    """Creates and atomically publishes the smallest validated PDF candidate."""
+    if target_dpi <= 0:
+        raise ValueError("target_dpi must be positive")
+    if not 1 <= jpeg_quality <= 100:
+        raise ValueError("jpeg_quality must be between 1 and 100")
+
+    resolved_threshold = dpi_threshold or max(target_dpi + 1, round(target_dpi * 1.5))
+    if resolved_threshold <= target_dpi:
+        raise ValueError("dpi_threshold must be greater than target_dpi")
+
+    expected_invariants = _document_invariants(input_path, render_check=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output_path.stem}_compress_",
+        dir=output_path.parent,
+    ) as temporary_dir:
+        stage_dir = Path(temporary_dir)
+        candidates = [input_path]
+        lossless_path = stage_dir / "lossless.pdf"
+
+        with pymupdf.open(input_path) as doc:
+            _save_compressed_document(doc, lossless_path)
+        if _valid_compression_candidate(lossless_path, expected_invariants):
+            candidates.append(lossless_path)
+
+        best_path = min(candidates, key=lambda path: path.stat().st_size)
+        needs_image_rewrite = max_bytes is None or best_path.stat().st_size >= max_bytes
+        if needs_image_rewrite:
+            rewritten_path = stage_dir / "rewritten.pdf"
+            with pymupdf.open(best_path) as doc:
+                doc.rewrite_images(
+                    dpi_threshold=resolved_threshold,
+                    dpi_target=target_dpi,
+                    quality=jpeg_quality,
+                    lossy=True,
+                    lossless=True,
+                    bitonal=True,
+                    color=True,
+                    gray=True,
+                    set_to_gray=False,
+                )
+                _save_compressed_document(doc, rewritten_path)
+            if _valid_compression_candidate(rewritten_path, expected_invariants):
+                candidates.append(rewritten_path)
+
+        selected_path = min(candidates, key=lambda path: path.stat().st_size)
+        publish_path = stage_dir / "publish.pdf"
+        shutil.copy2(selected_path, publish_path)
+        os.replace(publish_path, output_path)
+
+
+def _compress_pdf_worker(job: dict) -> dict:
+    """Compresses one PDF in an isolated process and returns a small result."""
+    started_at = time.perf_counter()
+    try:
+        compress_single_pdf(
+            Path(job["input_path"]),
+            Path(job["output_path"]),
+            target_dpi=job["target_dpi"],
+            jpeg_quality=job["jpeg_quality"],
+            max_bytes=job["max_bytes"],
+            dpi_threshold=job["dpi_threshold"],
+        )
+        return {
+            **job,
+            "new_bytes": Path(job["output_path"]).stat().st_size,
+            "elapsed_seconds": time.perf_counter() - started_at,
+            "error": None,
+        }
+    except Exception as error:
+        return {
+            **job,
+            "new_bytes": 0,
+            "elapsed_seconds": time.perf_counter() - started_at,
+            "error": str(error),
+        }
+
+
+def _record_compression_result(
+    result: dict,
+    stats: dict,
+    completed: int,
+    total: int,
+    quiet: bool,
+) -> None:
+    """Updates parent-owned statistics and reports one completed worker job."""
+    stats["count"] += 1
+    stats["orig_bytes"] += result["orig_bytes"]
+
+    if result["error"] is not None:
+        stats["failed"] += 1
+        print(
+            f"  [FAIL {completed}/{total}] {result['rel_path']} after "
+            f"{result['elapsed_seconds']:.1f}s: {result['error']}",
+            flush=True,
+        )
+        return
+
+    stats["new_bytes"] += result["new_bytes"]
+    if quiet:
+        return
+
+    orig_mb = result["orig_bytes"] / (1024 * 1024)
+    new_mb = result["new_bytes"] / (1024 * 1024)
+    savings = (((orig_mb - new_mb) / orig_mb) * 100) if orig_mb > 0 else 0
+    print(
+        f"  [DONE {completed}/{total}] {result['rel_path']} "
+        f"({orig_mb:.2f}MB -> {new_mb:.2f}MB, -{savings:.1f}%, "
+        f"{result['elapsed_seconds']:.1f}s)",
+        flush=True,
+    )
+
+
+def compress_step(
+    converted_root: Path,
+    compressed_root: Path,
+    target_dpi=200,
+    jpeg_quality=80,
+    max_mb=50.0,
+    skip_copy=False,
+    quiet=False,
+    skip_compression=False,
+    dpi_threshold: int | None = None,
+    workers: int | None = None,
+):
     """Recursively compresses all PDFs found in converted_root.
 
     Only files LARGER than ``max_mb`` are compressed; smaller files are copied
@@ -184,9 +295,17 @@ def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, j
     When ``quiet`` is True, per-file "skipped"/"compressed" lines are
     suppressed and only a summary count is printed at the end.
     """
+    if workers is None:
+        workers = min(2, os.cpu_count() or 1)
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+
     stats = {"count": 0, "failed": 0, "orig_bytes": 0, "new_bytes": 0, "skipped": 0}
 
-    pdf_files = list(converted_root.rglob("*.pdf"))
+    pdf_files = sorted(
+        converted_root.rglob("*.pdf"),
+        key=lambda path: path.relative_to(converted_root).as_posix().lower(),
+    )
 
     if not pdf_files:
         print("  \u2139\ufe0f No .pdf files found to compress.")
@@ -198,6 +317,7 @@ def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, j
     else:
         print(f"  Found {len(pdf_files)} PDF file(s) to process (threshold: {max_mb} MB)...")
 
+    compression_jobs = []
     for pdf_path in pdf_files:
         rel_path = pdf_path.relative_to(converted_root)
         output_pdf_path = compressed_root / rel_path
@@ -243,22 +363,85 @@ def compress_step(converted_root: Path, compressed_root: Path, target_dpi=200, j
             stats["new_bytes"] += orig_bytes
             continue
 
-        try:
-            compress_single_pdf(
-                pdf_path, output_pdf_path, target_dpi=target_dpi, jpeg_quality=jpeg_quality
-            )
-            new_bytes = output_pdf_path.stat().st_size
-            new_mb = new_bytes / (1024 * 1024)
-            savings = (((orig_mb - new_mb) / orig_mb) * 100) if orig_mb > 0 else 0
-            if not quiet:
-                print(f"  \u2022 Compressed: {rel_path} ({orig_mb:.2f}MB \u2192 {new_mb:.2f}MB, -{savings:.1f}%)")
+        compression_jobs.append({
+            "input_path": str(pdf_path),
+            "output_path": str(output_pdf_path),
+            "rel_path": str(rel_path),
+            "orig_bytes": orig_bytes,
+            "target_dpi": target_dpi,
+            "jpeg_quality": jpeg_quality,
+            "max_bytes": max_bytes,
+            "dpi_threshold": dpi_threshold,
+        })
 
-            stats["count"] += 1
-            stats["orig_bytes"] += orig_bytes
-            stats["new_bytes"] += new_bytes
-        except Exception as e:
-            print(f"  \u274c Failed compression for {pdf_path.name}: {e}")
-            stats["failed"] += 1
+    if compression_jobs:
+        effective_workers = min(workers, len(compression_jobs), os.cpu_count() or 1)
+        total_jobs = len(compression_jobs)
+        print(
+            f"  Using {effective_workers} compression worker process(es) for "
+            f"{total_jobs} oversized PDF(s).",
+            flush=True,
+        )
+
+        if effective_workers == 1:
+            for job_number, job in enumerate(compression_jobs, start=1):
+                if not quiet:
+                    print(
+                        f"  [START {job_number}/{total_jobs}] {job['rel_path']} "
+                        f"({job['orig_bytes'] / (1024 * 1024):.2f} MB)",
+                        flush=True,
+                    )
+                result = _compress_pdf_worker(job)
+                _record_compression_result(
+                    result, stats, job_number, total_jobs, quiet
+                )
+        else:
+            completed = 0
+            next_job = 0
+            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                pending = {}
+                while next_job < total_jobs and len(pending) < effective_workers:
+                    job = compression_jobs[next_job]
+                    next_job += 1
+                    if not quiet:
+                        print(
+                            f"  [START {next_job}/{total_jobs}] {job['rel_path']} "
+                            f"({job['orig_bytes'] / (1024 * 1024):.2f} MB)",
+                            flush=True,
+                        )
+                    pending[executor.submit(_compress_pdf_worker, job)] = job
+
+                while pending:
+                    done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        job = pending.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as error:
+                            result = {
+                                **job,
+                                "new_bytes": 0,
+                                "elapsed_seconds": 0.0,
+                                "error": f"worker process failed: {error}",
+                            }
+                        completed += 1
+                        _record_compression_result(
+                            result, stats, completed, total_jobs, quiet
+                        )
+
+                        if next_job < total_jobs:
+                            next_job += 1
+                            next_item = compression_jobs[next_job - 1]
+                            if not quiet:
+                                print(
+                                    f"  [START {next_job}/{total_jobs}] "
+                                    f"{next_item['rel_path']} "
+                                    f"({next_item['orig_bytes'] / (1024 * 1024):.2f} MB)",
+                                    flush=True,
+                                )
+                            pending[
+                                executor.submit(_compress_pdf_worker, next_item)
+                            ] = next_item
 
     if quiet:
         print(f"  \u2139\ufe0f Processed {stats['count']} file(s): "
@@ -345,9 +528,10 @@ def print_summary(compress_stats: dict, validate_stats: dict, max_mb: float, chu
     print(f"  \u274c Failed (>= {max_mb} MB)    : {validate_stats['failed']}")
     if validate_stats["largest_file"]:
         print(f"  Largest output file    : {validate_stats['largest_file']} ({validate_stats['largest_mb']:.2f} MB)")
-    if chunk_stats and (chunk_stats["chunked"] > 0 or chunk_stats["produced"] > 0):
+    if chunk_stats is not None:
         print(f"  Files chunked          : {chunk_stats['chunked']}")
         print(f"  Chunks produced        : {chunk_stats['produced']}")
+        print(f"  Oversized pages rescued : {chunk_stats.get('rescued_pages', 0)}")
         print(f"  Chunks still over limit : {chunk_stats['still_over']}")
         print(f"  Chunk failures         : {chunk_stats['failed']}")
     print("==================================================================")
@@ -430,82 +614,178 @@ def assert_file_count(source_root: Path, compressed_root: Path, pdf_only: bool, 
     return actual == expected
 
 
-# Max re-chunking passes to prevent infinite loops.
-MAX_RECHUNK_PASSES = 2
+def _serialize_pdf_range(doc, start_page: int, end_page: int) -> bytes:
+    """Serializes pages [start_page, end_page) using the final save settings."""
+    chunk_doc = pymupdf.open()
+    try:
+        chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
+        return chunk_doc.tobytes(garbage=3, deflate=True)
+    finally:
+        chunk_doc.close()
 
 
-def _fallback_split_points(num_pages: int, file_size_mb: float, target_mb: float) -> list[int]:
-    """Even page-count-based split into chunks of roughly equal page count."""
-    if num_pages <= 1:
-        return [0]
-    if target_mb <= 0:
-        # Avoid division by zero: split into one page per chunk.
-        return list(range(0, num_pages))
-    est_chunks = max(2, int(file_size_mb / target_mb) + 1)
-    pages_per_chunk = max(1, num_pages // est_chunks)
-    points = list(range(0, num_pages, pages_per_chunk))
-    if points[0] != 0:
-        points.insert(0, 0)
-    return points
+def _rescue_oversized_page(doc, page_index: int, max_bytes: float):
+    """Rasterizes one oversized page at progressively smaller settings."""
+    page = doc[page_index]
+    attempts = (
+        (180, 75),
+        (150, 70),
+        (120, 60),
+        (96, 50),
+        (72, 40),
+        (50, 30),
+    )
+
+    for dpi, jpeg_quality in attempts:
+        pixmap = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
+        image = Image.frombytes("L", (pixmap.width, pixmap.height), pixmap.samples)
+        image_buffer = io.BytesIO()
+        image.save(
+            image_buffer,
+            format="JPEG",
+            quality=jpeg_quality,
+            optimize=True,
+        )
+
+        rescued_doc = pymupdf.open()
+        try:
+            rescued_page = rescued_doc.new_page(
+                width=page.rect.width,
+                height=page.rect.height,
+            )
+            rescued_page.insert_image(
+                rescued_page.rect,
+                stream=image_buffer.getvalue(),
+            )
+            rescued_bytes = rescued_doc.tobytes(garbage=3, deflate=True)
+        finally:
+            rescued_doc.close()
+
+        if len(rescued_bytes) < max_bytes:
+            return rescued_bytes, dpi, jpeg_quality
+
+    return None
 
 
-def _split_pdf_at_pages(
-    pdf_path: Path, output_dir: Path, split_points: list[int], name_prefix: str
-) -> list[Path]:
-    """Splits a PDF at the given 0-indexed page boundaries.
+def _stage_precise_chunks(
+    pdf_path: Path,
+    staging_dir: Path,
+    name_prefix: str,
+    max_bytes: float,
+) -> list[dict]:
+    """Builds ordered chunks whose exact serialized bytes are under the limit."""
+    if max_bytes <= 0:
+        raise ValueError("The maximum PDF size must be greater than zero.")
 
-    Names chunks: {name_prefix}_chunk-1.pdf, {name_prefix}_chunk-2.pdf, etc.
-    Returns the list of output file paths.
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
     doc = pymupdf.open(pdf_path)
-    total_pages = len(doc)
-    output_paths = []
+    chunks = []
 
     try:
-        for i in range(len(split_points)):
-            start = split_points[i]
-            end = split_points[i + 1] if i + 1 < len(split_points) else total_pages
-            new_doc = pymupdf.open()
-            new_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
-            chunk_name = f"{name_prefix}_chunk-{i + 1}.pdf"
-            chunk_path = output_dir / chunk_name
-            new_doc.save(chunk_path, garbage=3, deflate=True)
-            new_doc.close()
-            output_paths.append(chunk_path)
+        total_pages = len(doc)
+        if total_pages == 0:
+            raise ValueError("The PDF contains no pages.")
+
+        start_page = 0
+        while start_page < total_pages:
+            end_page = start_page
+            accepted_bytes = None
+
+            while end_page < total_pages:
+                candidate_bytes = _serialize_pdf_range(
+                    doc,
+                    start_page,
+                    end_page + 1,
+                )
+                if len(candidate_bytes) >= max_bytes:
+                    break
+                accepted_bytes = candidate_bytes
+                end_page += 1
+
+            rescued = False
+            rescue_settings = None
+            if accepted_bytes is None:
+                rescue_result = _rescue_oversized_page(
+                    doc,
+                    start_page,
+                    max_bytes,
+                )
+                if rescue_result is None:
+                    page_number = start_page + 1
+                    raise ValueError(
+                        f"page {page_number} cannot be reduced below the size limit"
+                    )
+                accepted_bytes, dpi, jpeg_quality = rescue_result
+                end_page = start_page + 1
+                rescued = True
+                rescue_settings = (dpi, jpeg_quality)
+
+            chunk_number = len(chunks) + 1
+            chunk_path = staging_dir / f"{name_prefix}_chunk-{chunk_number}.pdf"
+            chunk_path.write_bytes(accepted_bytes)
+            if chunk_path.stat().st_size >= max_bytes:
+                raise RuntimeError(
+                    f"staged chunk {chunk_number} is not strictly under the size limit"
+                )
+
+            chunks.append({
+                "path": chunk_path,
+                "start_page": start_page,
+                "end_page": end_page,
+                "size_bytes": len(accepted_bytes),
+                "rescued": rescued,
+                "rescue_settings": rescue_settings,
+            })
+            start_page = end_page
     finally:
         doc.close()
 
-    return output_paths
+    return chunks
 
 
-def _split_pdf_at_pages_with_suffix(
-    pdf_path: Path, output_dir: Path, split_points: list[int], name_prefix: str, suffix_letter: str
+def _commit_precise_chunks(
+    chunks: list[dict],
+    output_pdf: Path,
+    output_dir: Path,
+    name_prefix: str,
 ) -> list[Path]:
-    """Like _split_pdf_at_pages but names chunks with a letter suffix for re-chunking.
+    """Atomically replaces one over-limit PDF and its stale chunks."""
+    backup_dir = chunks[0]["path"].parent / "backup"
+    backup_dir.mkdir()
+    stale_prefix = f"{name_prefix}_chunk-"
+    stale_chunks = [
+        path
+        for path in output_dir.iterdir()
+        if path.is_file()
+        and path.name.startswith(stale_prefix)
+        and path.suffix.lower() == ".pdf"
+    ]
+    old_paths = stale_chunks
+    if output_pdf.exists() and output_pdf not in old_paths:
+        old_paths.append(output_pdf)
 
-    Names chunks: {name_prefix}_chunk-{N}{suffix_letter}.pdf (e.g. _chunk-1a.pdf).
-    """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    doc = pymupdf.open(pdf_path)
-    total_pages = len(doc)
-    output_paths = []
-
+    backups = []
+    committed = []
     try:
-        for i in range(len(split_points)):
-            start = split_points[i]
-            end = split_points[i + 1] if i + 1 < len(split_points) else total_pages
-            new_doc = pymupdf.open()
-            new_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
-            chunk_name = f"{name_prefix}_chunk-{i + 1}{suffix_letter}.pdf"
-            chunk_path = output_dir / chunk_name
-            new_doc.save(chunk_path, garbage=3, deflate=True)
-            new_doc.close()
-            output_paths.append(chunk_path)
-    finally:
-        doc.close()
+        for old_path in old_paths:
+            backup_path = backup_dir / old_path.name
+            old_path.replace(backup_path)
+            backups.append((backup_path, old_path))
 
-    return output_paths
+        for chunk in chunks:
+            final_path = output_dir / chunk["path"].name
+            chunk["path"].replace(final_path)
+            chunk["path"] = final_path
+            committed.append(final_path)
+    except Exception:
+        for final_path in committed:
+            if final_path.exists():
+                final_path.unlink()
+        for backup_path, old_path in reversed(backups):
+            if backup_path.exists():
+                backup_path.replace(old_path)
+        raise
+
+    return committed
 
 
 def chunk_step(
@@ -514,7 +794,7 @@ def chunk_step(
     max_mb: float,
     source_root: Path | None = None,
 ) -> dict:
-    """Chunks over-limit PDFs into smaller files using page-count splitting.
+    """Chunks over-limit PDFs once using exact serialized byte sizes.
 
     Args:
         overlimit_files: list of (rel_path_str, size_mb) tuples from validate_step.
@@ -524,19 +804,22 @@ def chunk_step(
             over-limit files failed compression (so they're not in compressed_root),
             the chunk step falls back to the source file.
 
-    Returns a stats dict: {chunked, produced, still_over, failed}
+    Returns a stats dict: {chunked, produced, still_over, failed, rescued_pages}
     """
-    stats = {"chunked": 0, "produced": 0, "still_over": 0, "failed": 0}
+    stats = {
+        "chunked": 0,
+        "produced": 0,
+        "still_over": 0,
+        "failed": 0,
+        "rescued_pages": 0,
+    }
     max_bytes = max_mb * 1024 * 1024
-    target_mb = max_mb * 0.9  # Aim close to the limit (per user choice).
 
     if not overlimit_files:
         return stats
 
-    print(f"\n--- STEP 3b: PAGE-COUNT CHUNKING ({len(overlimit_files)} over-limit file(s)) ---")
+    print(f"\n--- STEP 3b: EXACT SIZE CHUNKING ({len(overlimit_files)} over-limit file(s)) ---")
 
-    # First pass: chunk each over-limit file.
-    new_chunks = []  # (path, rel_path) for re-validation
     for rel_path_str, size_mb in overlimit_files:
         pdf_path = compressed_root / rel_path_str
         if not pdf_path.exists():
@@ -558,162 +841,65 @@ def chunk_step(
                 continue
 
         stem = pdf_path.stem
+        output_pdf = compressed_root / rel_path_str
         output_dir = compressed_root / Path(rel_path_str).parent
         output_dir.mkdir(parents=True, exist_ok=True)
-        num_pages = 0
-        doc = pymupdf.open(pdf_path)
-        num_pages = len(doc)
-        doc.close()
-
-        if num_pages <= 1:
-            print(f"  \u274c Cannot chunk (only {num_pages} page): {rel_path_str} ({size_mb:.2f} MB)")
-            print(f"     This file needs manual intervention (e.g. re-scan at lower DPI).")
-            stats["failed"] += 1
-            continue
-
-        print(f"  \U0001f4c4 Chunking: {rel_path_str} ({size_mb:.2f} MB, {num_pages} pages)")
-
-        split_points = _fallback_split_points(num_pages, size_mb, target_mb)
-        print(f"     Split points (page indices): {split_points}")
+        print(f"  \U0001f4c4 Chunking: {rel_path_str} ({size_mb:.2f} MB)")
 
         try:
-            chunk_paths = _split_pdf_at_pages(pdf_path, output_dir, split_points, stem)
-            # Delete the original over-limit file from the output folder (if it was there).
-            out_pdf = compressed_root / rel_path_str
-            if out_pdf.exists():
-                out_pdf.unlink()
+            with tempfile.TemporaryDirectory(
+                prefix=f".{stem}_chunks_",
+                dir=output_dir,
+            ) as temporary_dir:
+                chunks = _stage_precise_chunks(
+                    pdf_path,
+                    Path(temporary_dir),
+                    stem,
+                    max_bytes,
+                )
+                chunk_paths = _commit_precise_chunks(
+                    chunks,
+                    output_pdf,
+                    output_dir,
+                    stem,
+                )
+
             stats["chunked"] += 1
             stats["produced"] += len(chunk_paths)
-            for cp in chunk_paths:
-                rel = cp.relative_to(compressed_root)
-                new_chunks.append((cp, str(rel)))
-                cp_mb = cp.stat().st_size / (1024 * 1024)
-                print(f"     \u2022 Produced: {rel} ({cp_mb:.2f} MB)")
+            for chunk, chunk_path in zip(chunks, chunk_paths):
+                rel = chunk_path.relative_to(compressed_root)
+                chunk_mb = chunk["size_bytes"] / (1024 * 1024)
+                page_range = (
+                    f"p. {chunk['start_page'] + 1}"
+                    if chunk["end_page"] == chunk["start_page"] + 1
+                    else f"pp. {chunk['start_page'] + 1}-{chunk['end_page']}"
+                )
+                rescue_note = ""
+                if chunk["rescued"]:
+                    dpi, quality = chunk["rescue_settings"]
+                    stats["rescued_pages"] += 1
+                    rescue_note = f", rasterized at {dpi} DPI / quality {quality}"
+                print(
+                    f"     \u2022 Produced: {rel} "
+                    f"({page_range}, {chunk_mb:.2f} MB{rescue_note})"
+                )
         except Exception as e:
             print(f"  \u274c Failed to chunk {rel_path_str}: {e}")
             stats["failed"] += 1
-            continue
-
-    # Re-chunking passes for any chunks still over the limit.
-    for pass_num in range(1, MAX_RECHUNK_PASSES + 1):
-        over_chunks = [(p, r) for (p, r) in new_chunks if p.stat().st_size >= max_bytes]
-        if not over_chunks:
-            break
-
-        print(f"\n  \U0001f501 RE-CHUNKING PASS {pass_num}: {len(over_chunks)} chunk(s) still over limit")
-        rechunk_target_mb = max_mb * 0.6  # Smaller target to ensure they fit.
-        suffix_letter = chr(ord("a") + pass_num - 1)  # 'a' for pass 1, 'b' for pass 2.
-        next_new_chunks = []
-
-        for chunk_path, rel_str in over_chunks:
-            chunk_mb = chunk_path.stat().st_size / (1024 * 1024)
-            stem = chunk_path.stem
-            output_dir = chunk_path.parent
-
-            doc = pymupdf.open(chunk_path)
-            num_pages = len(doc)
-            doc.close()
-
-            if num_pages <= 1:
-                print(f"     \u274c Cannot re-chunk (only {num_pages} page): {rel_str} ({chunk_mb:.2f} MB)")
-                stats["still_over"] += 1
-                next_new_chunks.append((chunk_path, rel_str))
-                continue
-
-            print(f"     \U0001f4c4 Re-chunking: {rel_str} ({chunk_mb:.2f} MB, {num_pages} pages)")
-
-            split_points = _fallback_split_points(num_pages, chunk_mb, rechunk_target_mb)
-            print(f"     Re-split points (page indices): {split_points}")
-
-            try:
-                rechunk_paths = _split_pdf_at_pages_with_suffix(
-                    chunk_path, output_dir, split_points, stem, suffix_letter
-                )
-                chunk_path.unlink()
-                stats["produced"] += len(rechunk_paths) - 1  # replaced 1 with N
-                for rp in rechunk_paths:
-                    rel = rp.relative_to(compressed_root)
-                    next_new_chunks.append((rp, str(rel)))
-                    rp_mb = rp.stat().st_size / (1024 * 1024)
-                    print(f"     \u2022 Produced: {rel} ({rp_mb:.2f} MB)")
-            except Exception as e:
-                print(f"     \u274c Failed to re-chunk {rel_str}: {e}")
-                stats["still_over"] += 1
-                next_new_chunks.append((chunk_path, rel_str))
-
-        # Replace new_chunks with the updated list for the next pass.
-        new_chunks = next_new_chunks
-
-    # Count any chunks still over the limit after all passes.
-    final_over = [p for (p, _) in new_chunks if p.stat().st_size >= max_bytes]
-    stats["still_over"] = len(final_over)
+            stats["still_over"] += 1
+            if not output_pdf.exists() and pdf_path != output_pdf:
+                try:
+                    shutil.copy2(pdf_path, output_pdf)
+                except Exception as copy_error:
+                    print(f"     \u274c Could not preserve failed source in output: {copy_error}")
 
     if stats["still_over"] > 0:
-        print(f"\n  \u26a0\ufe0f  {stats['still_over']} chunk(s) are STILL over {max_mb} MB after re-chunking.")
-        print(f"     These may need manual intervention (e.g. re-scan at lower DPI).")
+        print(f"\n  \u26a0\ufe0f  {stats['still_over']} file(s) could not be chunked below {max_mb} MB.")
+        print("     The original files were preserved for manual review.")
     else:
         print(f"\n  \u2705 All chunks are under {max_mb} MB.")
 
-    # Flatten chunk names: rename all chunks to a clean sequential scheme.
-    # e.g. "doc_chunk-2_chunk-1a_chunk-1b.pdf" -> "doc_chunk-1.pdf", "doc_chunk-2.pdf", ...
-    _flatten_chunk_names(new_chunks, compressed_root)
-
     return stats
-
-
-def _flatten_chunk_names(chunks: list, compressed_root: Path):
-    """Renames all chunk files to a clean sequential {stem}_chunk-{N}.pdf scheme.
-
-    After multi-pass re-chunking, files may have nested names like:
-      doc_chunk-2_chunk-1a_chunk-1b.pdf
-    This flattens them to:
-      doc_chunk-1.pdf, doc_chunk-2.pdf, ...
-
-    Groups chunks by their original document stem (everything before the first
-    '_chunk-') and renumbers sequentially within each group.
-    """
-    if not chunks:
-        return
-
-    # Group chunks by their original document stem.
-    # The original stem is everything before the first "_chunk-" in the filename.
-    groups: dict[str, list[Path]] = {}
-    for chunk_path, _ in chunks:
-        name = chunk_path.name
-        # Find the original stem: everything before the first "_chunk-"
-        marker = "_chunk-"
-        idx = name.find(marker)
-        if idx == -1:
-            # Not a chunk file, skip.
-            continue
-        original_stem = name[:idx]
-        groups.setdefault(original_stem, []).append(chunk_path)
-
-    renamed = []
-    for original_stem, chunk_paths in groups.items():
-        # Sort by file size descending so the largest chunks get the lowest numbers
-        # (keeps the natural reading order roughly intact).
-        chunk_paths.sort(key=lambda p: p.stat().st_size, reverse=True)
-
-        for i, old_path in enumerate(chunk_paths):
-            new_name = f"{original_stem}_chunk-{i + 1}.pdf"
-            new_path = old_path.parent / new_name
-
-            # Avoid name collisions: if new_path already exists (from a previous
-            # flatten or a non-chunk file), append a suffix.
-            if new_path.exists() and new_path != old_path:
-                new_path = old_path.parent / f"{original_stem}_chunk-{i + 1}_renamed.pdf"
-
-            if new_path != old_path:
-                old_path.rename(new_path)
-                renamed.append((old_path, new_path))
-
-    if renamed:
-        print(f"\n  \U0001f4cb Flattened {len(renamed)} chunk name(s) to clean sequential scheme:")
-        for old_path, new_path in renamed:
-            old_rel = old_path.name
-            new_rel = new_path.relative_to(compressed_root)
-            print(f"     {old_rel}  \u2192  {new_rel}")
 
 
 # ==============================================================================
@@ -744,11 +930,36 @@ def resolve_output_root(source_root: Path, output_arg: str | None, suffix: str) 
         # as the default, just with a user-chosen name instead of "<name> compressed".
         return source_root.parent / output_arg
 
+def _publish_output_tree(staged_root: Path, final_root: Path) -> None:
+    """Publishes a completed output tree while preserving the prior tree on failure."""
+    final_root.parent.mkdir(parents=True, exist_ok=True)
+    backup_root = final_root.parent / f".{final_root.name}.backup_{os.getpid()}"
+    if backup_root.exists():
+        raise FileExistsError(f"stale output backup exists: {backup_root}")
+
+    previous_moved = False
+    try:
+        if final_root.exists():
+            final_root.replace(backup_root)
+            previous_moved = True
+        staged_root.replace(final_root)
+    except Exception:
+        if previous_moved and backup_root.exists() and not final_root.exists():
+            backup_root.replace(final_root)
+        raise
+
+    if previous_moved:
+        if backup_root.is_dir():
+            shutil.rmtree(backup_root)
+        else:
+            backup_root.unlink()
+
 
 def run_tender_pipeline(
     source_folder_path: str,
     target_dpi=200,
     jpeg_quality=80,
+    dpi_threshold: int | None = None,
     max_mb=50.0,
     output_folder: str | None = None,
     pdf_only: bool = False,
@@ -757,35 +968,33 @@ def run_tender_pipeline(
     skip_copy: bool = False,
     quiet: bool = False,
     skip_compression: bool = False,
+    workers: int | None = None,
 ):
     source_root = Path(source_folder_path).resolve()
 
     if not source_root.exists() or not source_root.is_dir():
         print(f"Error: Source directory '{source_root}' does not exist.")
         sys.exit(1)
+    if target_dpi <= 0:
+        raise ValueError("--dpi must be positive")
+    if not 1 <= jpeg_quality <= 100:
+        raise ValueError("--quality must be between 1 and 100")
+    if dpi_threshold is not None and dpi_threshold <= target_dpi:
+        raise ValueError("--dpi-threshold must be greater than --dpi")
+    if max_mb <= 0:
+        raise ValueError("--max-mb must be positive")
+    if workers is not None and workers < 1:
+        raise ValueError("--workers must be at least 1")
 
-    converted_root = source_root.parent / f"{source_root.name} all-pdfs"
-    compressed_root = resolve_output_root(source_root, output_folder, "compressed")
-
-    # Safety check: ensure the output path is usable as a directory.
-    # If it exists as a file (e.g. leftover from a failed run), remove it.
-    if compressed_root.exists() and not compressed_root.is_dir():
-        print(f"  \u26a0\ufe0f  Output path '{compressed_root}' exists as a file, not a directory. Removing it.")
-        compressed_root.unlink()
-    # Create the output directory. On WSL/Docker shared mounts, mkdir can
-    # raise FileExistsError for a path that os.path.exists says doesn't exist
-    # (stale filesystem cache). Work around this by creating a temp dir and
-    # renaming it into place.
-    try:
-        compressed_root.mkdir(parents=True, exist_ok=True)
-    except FileExistsError:
-        if compressed_root.is_dir():
-            pass  # Directory exists, that's fine.
-        else:
-            import tempfile
-            tmp = compressed_root.parent / f"{compressed_root.name}.tmp_{os.getpid()}"
-            tmp.mkdir(parents=True, exist_ok=True)
-            tmp.rename(compressed_root)
+    final_output_root = resolve_output_root(source_root, output_folder, "compressed")
+    final_output_root.parent.mkdir(parents=True, exist_ok=True)
+    run_root = Path(tempfile.mkdtemp(
+        prefix=f".{final_output_root.name}.run_",
+        dir=final_output_root.parent,
+    ))
+    converted_root = run_root / "all-pdfs"
+    compressed_root = run_root / "output"
+    compressed_root.mkdir(parents=True)
 
     print("==================================================================")
     print(f"\U0001f680 STARTING TENDER DOCUMENT PIPELINE FOR: {source_root.name}")
@@ -816,6 +1025,7 @@ def run_tender_pipeline(
     compress_stats = compress_step(
         converted_root, compressed_root, target_dpi=target_dpi, jpeg_quality=jpeg_quality,
         max_mb=max_mb, skip_copy=skip_copy, quiet=quiet, skip_compression=skip_compression,
+        dpi_threshold=dpi_threshold, workers=workers,
     )
 
     print("\n--- STEP 3: VALIDATING FINAL FILE SIZES ---")
@@ -831,7 +1041,7 @@ def run_tender_pipeline(
     else:
         passed, validate_stats = validate_step(compressed_root, max_mb=max_mb, pdf_files=output_pdfs, quiet=quiet)
 
-    # --- STEP 3b: PAGE-COUNT CHUNKING ---
+    # --- STEP 3b: EXACT SIZE CHUNKING ---
     # If files are still over the limit after compression, offer to chunk them.
     # --silent auto-proceeds; otherwise the user is prompted interactively.
     # --no-chunk disables chunking entirely.
@@ -842,7 +1052,7 @@ def run_tender_pipeline(
 
         if not silent:
             print(f"\n  {len(overlimit)} file(s) are over the {max_mb} MB limit.")
-            print("  Chunking can split them into smaller PDFs using page-count splitting.")
+            print("  Chunking can split them once using exact serialized byte sizes.")
             try:
                 answer = input("\n  Proceed with chunking? [y/N] ").strip().lower()
                 proceed = answer in ("y", "yes")
@@ -878,15 +1088,26 @@ def run_tender_pipeline(
             output_pdfs=output_pdfs, chunked_count=chunked_count,
         )
 
+    compression_ok = compress_stats["failed"] == 0
     print()
-    if passed and count_ok:
+    if passed and count_ok and compression_ok:
+        try:
+            _publish_output_tree(compressed_root, final_output_root)
+            shutil.rmtree(run_root, ignore_errors=True)
+        except Exception as error:
+            print(f"Failed to publish completed output: {error}")
+            print(f"Staged files retained at: {run_root}")
+            sys.exit(1)
         print("\u2705 PIPELINE COMPLETED SUCCESSFULLY! Documents ready for submission.")
-        print(f"\U0001f4c1 Final files location: {compressed_root}")
+        print(f"\U0001f4c1 Final files location: {final_output_root}")
     else:
+        print(f"Staged files retained at: {run_root}")
         if not passed:
             print("\u274c PIPELINE COMPLETED WITH WARNINGS: Some files exceed the limit.")
         if not count_ok:
             print("\u274c PIPELINE COMPLETED WITH WARNINGS: File count mismatch (see above).")
+        if not compression_ok:
+            print("\u274c PIPELINE COMPLETED WITH WARNINGS: One or more PDFs failed compression.")
         sys.exit(1)
 
 
@@ -903,9 +1124,32 @@ if __name__ == "__main__":
                               "source folder. Path (e.g. '/mnt/d/Tenders/Final' or "
                               "'D:/Tenders/Final') -> used exactly as given. "
                               "Default: '<source folder name> compressed'.")
-    parser.add_argument("--dpi", type=int, default=200, help="Target DPI for image downsampling")
-    parser.add_argument("-q", "--quality", type=int, default=80, help="JPEG quality (1-100)")
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=200,
+        help="Target DPI for high-resolution images (minimum 200 recommended for OCR)",
+    )
+    parser.add_argument(
+        "--dpi-threshold",
+        type=int,
+        default=None,
+        help="Only downsample images above this effective DPI (default: 1.5 x --dpi)",
+    )
+    parser.add_argument(
+        "-q",
+        "--quality",
+        type=int,
+        default=80,
+        help="JPEG quality for rewritten images (1-100; color is preserved)",
+    )
     parser.add_argument("--max-mb", type=float, default=50.0, help="Max allowed file size in MB")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Concurrent PDF compression processes (default: 2; use 1 for low-memory systems)",
+    )
     parser.add_argument("--pdf-only", action="store_true",
                          help="Skip Word-to-PDF conversion and compress existing PDFs directly")
     parser.add_argument("--silent", action="store_true",
@@ -930,6 +1174,7 @@ if __name__ == "__main__":
         source_folder_path=args.input,
         target_dpi=args.dpi,
         jpeg_quality=args.quality,
+        dpi_threshold=args.dpi_threshold,
         max_mb=args.max_mb,
         output_folder=args.output,
         pdf_only=args.pdf_only,
@@ -938,4 +1183,5 @@ if __name__ == "__main__":
         skip_copy=args.skip_copy,
         quiet=args.quiet,
         skip_compression=args.skip_compression,
+        workers=args.workers,
     )

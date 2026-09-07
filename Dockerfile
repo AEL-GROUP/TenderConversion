@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
+ENV PYTHONUNBUFFERED=1
+
 # --- System dependencies -----------------------------------------------------
 # libreoffice-writer + libreoffice-core: headless .doc/.docx -> .pdf conversion
 # fonts-dejavu-core / fonts-liberation: common substitute fonts so converted
