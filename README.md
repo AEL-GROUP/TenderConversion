@@ -95,8 +95,8 @@ docker compose run --rm tender-pipeline -i /data/MyTender -o /data/MyTender_Fina
 That's it. The pipeline will:
 1. Convert all `.doc`/`.docx` files to PDF (via LibreOffice)
 2. Losslessly repack oversized PDFs, then downsample only high-DPI images if needed
-3. Validate every PDF is under the size limit (default 50 MB)
-4. Chunk any files still over the limit into smaller PDFs
+3. Validate every PDF against the size limit (default 50 MB) and page limit (default 500 pages)
+4. Chunk any files over either limit into compliant PDFs
 5. Write the final output to `/data/MyTender_Final`
 
 Compression preserves color, native text, vector drawings, page geometry, and
@@ -183,6 +183,7 @@ docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --skip-comp
 | `--dpi-threshold` | `1.5 x --dpi` | Rewrite only images displayed above this effective DPI. Must be greater than `--dpi`. |
 | `-q`, `--quality` | `80` | JPEG quality (1–100). Lower = smaller files but lower quality. |
 | `--max-mb` | `50.0` | Maximum allowed file size in MB. Files over this are compressed, then chunked if still over. |
+| `--max-pages` | `500` | Maximum pages allowed per output PDF. Files over this limit are chunked even when under the byte limit. |
 | `--workers` | `2` | Concurrent PDF compression processes. Use `1` for low-memory systems or slow shared mounts. |
 | `--pdf-only` | off | Skip Word-to-PDF conversion. Compress existing PDFs directly. |
 | `--silent` | off | Auto-proceed chunking without prompting. Use for automation/CI. |
@@ -238,16 +239,17 @@ multiple oversized PDFs are available.
 
 ## How Chunking Works
 
-When a PDF is still over the size limit after compression, the pipeline splits
-it into smaller PDFs using exact serialized byte sizes:
+When a PDF exceeds the size or page-count limit after compression, the pipeline
+splits it into smaller PDFs that satisfy both limits:
 
-1. **Greedy page packing** — Pages are added in their original order. After
-   each addition, the candidate chunk is serialized in memory using the same
-   settings as the final PDF.
+1. **Greedy page packing** — Pages are added in their original order, up to
+   `--max-pages`. After each addition, the candidate chunk is serialized in
+   memory using the same settings as the final PDF.
 
-2. **Exact boundary** — When the next page would reach or exceed the limit,
-   the last valid serialized bytes are written directly as the final chunk.
-   Final chunks are therefore written once and are strictly below the limit.
+2. **Exact boundary** — When the next page would reach the byte limit or the
+   chunk reaches the page limit, the last valid serialized bytes are written
+   directly. Final chunks are strictly below `--max-mb` and contain at most
+   `--max-pages` pages.
 
 3. **Oversized-page rescue** — If one page cannot fit by itself, only that page
    is rasterized at progressively lower DPI and JPEG quality until it fits.

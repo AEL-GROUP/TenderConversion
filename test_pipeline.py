@@ -242,6 +242,22 @@ class TestValidateStep:
         assert stats["failed"] == 1
         assert len(stats["overlimit_files"]) == 1
 
+    def test_page_limit_is_enforced_independently_of_size(self, tmp_path):
+        root = tmp_path / "output"
+        root.mkdir()
+        make_pdf(root / "many-pages.pdf", num_pages=3)
+
+        passed, stats = pipeline.validate_step(
+            root,
+            max_mb=50.0,
+            max_pages=2,
+        )
+
+        assert passed is False
+        assert stats["page_overlimit"] == 1
+        assert stats["size_overlimit"] == 0
+        assert stats["overlimit_files"][0][2] == 3
+
     def test_no_pdfs(self, tmp_path):
         root = tmp_path / "empty"
         root.mkdir()
@@ -343,6 +359,23 @@ class TestCompressStep:
         assert stats["skipped"] == 1
         # File should NOT be in the output folder
         assert not (out / "small.pdf").exists()
+
+    def test_skip_copy_stages_page_oversized_pdf_for_chunking(self, tmp_path):
+        src = tmp_path / "src"
+        out = tmp_path / "out"
+        src.mkdir()
+        make_pdf(src / "many-pages.pdf", num_pages=3)
+
+        stats = pipeline.compress_step(
+            src,
+            out,
+            max_mb=50.0,
+            max_pages=2,
+            skip_copy=True,
+        )
+
+        assert stats["skipped"] == 1
+        assert (out / "many-pages.pdf").exists()
 
     def test_skip_compression_copies_all(self, tmp_path):
         src = tmp_path / "src"
@@ -446,6 +479,26 @@ class TestCompressStep:
 # Tests: chunk_step (integration)
 # ------------------------------------------------------------------------------
 class TestChunkStep:
+    def test_chunks_to_page_limit_even_when_bytes_are_under_limit(self, tmp_path):
+        out = tmp_path / "out"
+        out.mkdir()
+        pdf_path = make_pdf(out / "many-pages.pdf", num_pages=5)
+
+        cstats = pipeline.chunk_step(
+            [(pdf_path.name, pdf_path.stat().st_size / (1024 * 1024), 5)],
+            out,
+            max_mb=50.0,
+            max_pages=2,
+        )
+
+        chunks = sorted(out.glob("many-pages_chunk-*.pdf"))
+        assert cstats["produced"] == 3
+        page_counts = []
+        for chunk in chunks:
+            with pymupdf.open(chunk) as chunk_doc:
+                page_counts.append(chunk_doc.page_count)
+        assert page_counts == [2, 2, 1]
+
     def test_chunks_once_under_exact_limit_in_page_order(self, tmp_path):
         out = tmp_path / "out"
         out.mkdir()
@@ -662,6 +715,29 @@ class TestPipelineSkipCompression:
         assert not (out / "big.pdf").exists()
         chunks = list(out.glob("big_chunk-*.pdf"))
         assert len(chunks) >= 2
+
+    def test_page_limit_triggers_chunking_without_size_failure(self, tmp_path):
+        src = tmp_path / "tender"
+        out = tmp_path / "final"
+        src.mkdir()
+        make_pdf(src / "many-pages.pdf", num_pages=5)
+
+        pipeline.run_tender_pipeline(
+            source_folder_path=str(src),
+            output_folder=str(out),
+            pdf_only=True,
+            skip_compression=True,
+            silent=True,
+            quiet=True,
+            max_mb=50.0,
+            max_pages=2,
+        )
+
+        chunks = sorted(out.glob("many-pages_chunk-*.pdf"))
+        assert len(chunks) == 3
+        for chunk in chunks:
+            with pymupdf.open(chunk) as doc:
+                assert doc.page_count <= 2
 
 
 if __name__ == "__main__":

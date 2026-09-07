@@ -277,6 +277,7 @@ def compress_step(
     skip_compression=False,
     dpi_threshold: int | None = None,
     workers: int | None = None,
+    max_pages: int = 500,
 ):
     """Recursively compresses all PDFs found in converted_root.
 
@@ -299,6 +300,8 @@ def compress_step(
         workers = min(2, os.cpu_count() or 1)
     if workers < 1:
         raise ValueError("workers must be at least 1")
+    if max_pages < 1:
+        raise ValueError("max_pages must be at least 1")
 
     stats = {"count": 0, "failed": 0, "orig_bytes": 0, "new_bytes": 0, "skipped": 0}
 
@@ -347,12 +350,22 @@ def compress_step(
         # because re-encoding them can sometimes produce a larger output.
         if orig_bytes <= max_bytes:
             if skip_copy:
-                # Don't copy — just record stats. The file stays in its original location.
-                stats["skipped"] += 1
-                stats["count"] += 1
-                stats["orig_bytes"] += orig_bytes
-                stats["new_bytes"] += orig_bytes
-                continue
+                try:
+                    with pymupdf.open(pdf_path) as doc:
+                        page_count = doc.page_count
+                except Exception:
+                    page_count = max_pages + 1
+                if page_count <= max_pages:
+                    stats["skipped"] += 1
+                    stats["count"] += 1
+                    stats["orig_bytes"] += orig_bytes
+                    stats["new_bytes"] += orig_bytes
+                    continue
+                if not quiet:
+                    print(
+                        f"  \u26a0\ufe0f Page limit exceeded: {rel_path} "
+                        f"({page_count} pages > {max_pages}) -> copied for chunking"
+                    )
             output_pdf_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(pdf_path, output_pdf_path)
             if not quiet:
@@ -454,15 +467,26 @@ def compress_step(
 # ==============================================================================
 # STEP 3: VALIDATE FILE SIZES (strictly under the limit)
 # ==============================================================================
-def validate_step(compressed_root: Path, max_mb: float = 50.0, pdf_files=None, quiet=False):
-    """Validates that all compressed PDFs are STRICTLY under the size limit.
+def validate_step(
+    compressed_root: Path,
+    max_mb: float = 50.0,
+    max_pages: int = 500,
+    pdf_files=None,
+    quiet=False,
+):
+    """Validates that PDFs are under the byte limit and within the page limit.
 
     When ``quiet`` is True, per-file PASS/FAIL lines are suppressed and only
     a summary count is printed.
     """
+    if max_pages < 1:
+        raise ValueError("The maximum PDF page count must be at least one.")
+
     stats = {
         "count": 0, "passed": 0, "failed": 0,
         "largest_mb": 0.0, "largest_file": None,
+        "largest_pages": 0, "largest_page_file": None,
+        "size_overlimit": 0, "page_overlimit": 0, "unreadable": 0,
         "overlimit_files": [],
     }
 
@@ -485,32 +509,85 @@ def validate_step(compressed_root: Path, max_mb: float = 50.0, pdf_files=None, q
             stats["largest_mb"] = file_size_mb
             stats["largest_file"] = str(rel_path)
 
-        if file_size_bytes >= max_bytes:
-            stats["overlimit_files"].append((str(rel_path), file_size_mb))
+        try:
+            with pymupdf.open(pdf_path) as doc:
+                page_count = doc.page_count
+        except Exception as error:
+            stats["unreadable"] += 1
             stats["failed"] += 1
+            stats["overlimit_files"].append((str(rel_path), file_size_mb, None))
             if not quiet:
-                print(f"  \u274c [EXCEEDS LIMIT] {rel_path} -> {file_size_mb:.2f} MB")
+                print(f"  \u274c [UNREADABLE] {rel_path} -> {error}")
+            continue
+
+        if page_count > stats["largest_pages"]:
+            stats["largest_pages"] = page_count
+            stats["largest_page_file"] = str(rel_path)
+
+        size_exceeded = file_size_bytes >= max_bytes
+        pages_exceeded = page_count > max_pages
+        if size_exceeded or pages_exceeded:
+            stats["overlimit_files"].append(
+                (str(rel_path), file_size_mb, page_count)
+            )
+            stats["failed"] += 1
+            if size_exceeded:
+                stats["size_overlimit"] += 1
+            if pages_exceeded:
+                stats["page_overlimit"] += 1
+            if not quiet:
+                reasons = []
+                if size_exceeded:
+                    reasons.append(f"size must be under {max_mb} MB")
+                if pages_exceeded:
+                    reasons.append(f"pages must be at most {max_pages}")
+                print(
+                    f"  \u274c [EXCEEDS LIMIT] {rel_path} -> "
+                    f"{file_size_mb:.2f} MB, {page_count} pages "
+                    f"({' and '.join(reasons)})"
+                )
         else:
             stats["passed"] += 1
             if not quiet:
-                print(f"  \u2705 [PASS] {rel_path} -> {file_size_mb:.2f} MB")
+                print(
+                    f"  \u2705 [PASS] {rel_path} -> "
+                    f"{file_size_mb:.2f} MB, {page_count} pages"
+                )
 
     if quiet:
-        print(f"  \u2139\ufe0f Validated {stats['count']} file(s): "
-              f"{stats['passed']} passed, {stats['failed']} over limit.")
+        print(
+            f"  \u2139\ufe0f Validated {stats['count']} file(s): "
+            f"{stats['passed']} passed, {stats['failed']} failed "
+            f"({stats['size_overlimit']} by size, "
+            f"{stats['page_overlimit']} by pages, "
+            f"{stats['unreadable']} unreadable)."
+        )
 
     if stats["overlimit_files"]:
-        print(f"\n\U0001f6a8 VALIDATION FAILED: {len(stats['overlimit_files'])} file(s) at/over {max_mb} MB!")
+        print(
+            f"\n\U0001f6a8 VALIDATION FAILED: "
+            f"{len(stats['overlimit_files'])} file(s) exceed the limits "
+            f"(under {max_mb} MB and at most {max_pages} pages)."
+        )
         return False, stats
 
-    print(f"\n\U0001f389 ALL CLEAR: All files are verified strictly under {max_mb} MB.")
+    print(
+        f"\n\U0001f389 ALL CLEAR: All files are strictly under {max_mb} MB "
+        f"and contain at most {max_pages} pages."
+    )
     return True, stats
 
 
 # ==============================================================================
 # STEP 4: PRINT SUMMARY STATISTICS
 # ==============================================================================
-def print_summary(compress_stats: dict, validate_stats: dict, max_mb: float, chunk_stats: dict | None = None):
+def print_summary(
+    compress_stats: dict,
+    validate_stats: dict,
+    max_mb: float,
+    max_pages: int = 500,
+    chunk_stats: dict | None = None,
+):
     orig_mb = compress_stats["orig_bytes"] / (1024 * 1024)
     new_mb = compress_stats["new_bytes"] / (1024 * 1024)
     saved_mb = orig_mb - new_mb
@@ -524,10 +601,15 @@ def print_summary(compress_stats: dict, validate_stats: dict, max_mb: float, chu
     print(f"  Total size after       : {new_mb:.2f} MB")
     print(f"  Total space saved      : {saved_mb:.2f} MB ({saved_pct:.1f}%)")
     print(f"  Files validated        : {validate_stats['count']}")
-    print(f"  \u2705 Passed (< {max_mb} MB)     : {validate_stats['passed']}")
-    print(f"  \u274c Failed (>= {max_mb} MB)    : {validate_stats['failed']}")
+    print(f"  \u2705 Passed both limits    : {validate_stats['passed']}")
+    print(f"  \u274c Failed any limit      : {validate_stats['failed']}")
+    print(f"     Size failures (>= {max_mb} MB): {validate_stats['size_overlimit']}")
+    print(f"     Page failures (> {max_pages}) : {validate_stats['page_overlimit']}")
+    print(f"     Unreadable PDFs          : {validate_stats['unreadable']}")
     if validate_stats["largest_file"]:
         print(f"  Largest output file    : {validate_stats['largest_file']} ({validate_stats['largest_mb']:.2f} MB)")
+    if validate_stats["largest_page_file"]:
+        print(f"  Largest page count     : {validate_stats['largest_page_file']} ({validate_stats['largest_pages']} pages)")
     if chunk_stats is not None:
         print(f"  Files chunked          : {chunk_stats['chunked']}")
         print(f"  Chunks produced        : {chunk_stats['produced']}")
@@ -539,10 +621,17 @@ def print_summary(compress_stats: dict, validate_stats: dict, max_mb: float, chu
     # Highlight any files that are still over the limit so they stand out
     overlimit_files = validate_stats.get("overlimit_files", [])
     if overlimit_files:
-        print(f"\n\U0001f6a8 \U0001f6a8 \U0001f6a8  FILES STILL OVER THE {max_mb} MB LIMIT  \U0001f6a8 \U0001f6a8 \U0001f6a8")
+        print(f"\n\U0001f6a8 \U0001f6a8 \U0001f6a8  FILES STILL OVER THE OUTPUT LIMITS  \U0001f6a8 \U0001f6a8 \U0001f6a8")
         print("------------------------------------------------------------------")
-        for rel_path, size_mb in overlimit_files:
-            print(f"  \u274c {rel_path}  ->  {size_mb:.2f} MB")
+        for overlimit_file in overlimit_files:
+            rel_path, size_mb, *page_count_values = overlimit_file
+            page_count = page_count_values[0] if page_count_values else None
+            page_text = (
+                f", {page_count} pages"
+                if page_count is not None
+                else ", unreadable"
+            )
+            print(f"  \u274c {rel_path}  ->  {size_mb:.2f} MB{page_text}")
         print("------------------------------------------------------------------")
         print(f"  {len(overlimit_files)} file(s) need manual review / further compression.\n")
 
@@ -672,10 +761,13 @@ def _stage_precise_chunks(
     staging_dir: Path,
     name_prefix: str,
     max_bytes: float,
+    max_pages: int = 500,
 ) -> list[dict]:
-    """Builds ordered chunks whose exact serialized bytes are under the limit."""
+    """Builds ordered chunks within exact byte and page-count limits."""
     if max_bytes <= 0:
         raise ValueError("The maximum PDF size must be greater than zero.")
+    if max_pages < 1:
+        raise ValueError("The maximum PDF page count must be at least one.")
 
     doc = pymupdf.open(pdf_path)
     chunks = []
@@ -690,7 +782,10 @@ def _stage_precise_chunks(
             end_page = start_page
             accepted_bytes = None
 
-            while end_page < total_pages:
+            while (
+                end_page < total_pages
+                and end_page - start_page < max_pages
+            ):
                 candidate_bytes = _serialize_pdf_range(
                     doc,
                     start_page,
@@ -725,6 +820,10 @@ def _stage_precise_chunks(
             if chunk_path.stat().st_size >= max_bytes:
                 raise RuntimeError(
                     f"staged chunk {chunk_number} is not strictly under the size limit"
+                )
+            if end_page - start_page > max_pages:
+                raise RuntimeError(
+                    f"staged chunk {chunk_number} exceeds the page limit"
                 )
 
             chunks.append({
@@ -793,13 +892,15 @@ def chunk_step(
     compressed_root: Path,
     max_mb: float,
     source_root: Path | None = None,
+    max_pages: int = 500,
 ) -> dict:
-    """Chunks over-limit PDFs once using exact serialized byte sizes.
+    """Chunks over-limit PDFs once using exact byte and page-count limits.
 
     Args:
-        overlimit_files: list of (rel_path_str, size_mb) tuples from validate_step.
+        overlimit_files: tuples from validate_step containing path, size, and pages.
         compressed_root: the output folder containing the compressed PDFs.
         max_mb: the strict size limit each chunk must be under.
+        max_pages: the maximum page count allowed in each chunk.
         source_root: the original source folder. When --skip-copy is used and
             over-limit files failed compression (so they're not in compressed_root),
             the chunk step falls back to the source file.
@@ -820,7 +921,9 @@ def chunk_step(
 
     print(f"\n--- STEP 3b: EXACT SIZE CHUNKING ({len(overlimit_files)} over-limit file(s)) ---")
 
-    for rel_path_str, size_mb in overlimit_files:
+    for overlimit_file in overlimit_files:
+        rel_path_str, size_mb, *page_count_values = overlimit_file
+        page_count = page_count_values[0] if page_count_values else None
         pdf_path = compressed_root / rel_path_str
         if not pdf_path.exists():
             # With --skip-copy, over-limit files may not have been copied to the
@@ -844,7 +947,11 @@ def chunk_step(
         output_pdf = compressed_root / rel_path_str
         output_dir = compressed_root / Path(rel_path_str).parent
         output_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  \U0001f4c4 Chunking: {rel_path_str} ({size_mb:.2f} MB)")
+        page_note = f", {page_count} pages" if page_count is not None else ""
+        print(
+            f"  \U0001f4c4 Chunking: {rel_path_str} "
+            f"({size_mb:.2f} MB{page_note})"
+        )
 
         try:
             with tempfile.TemporaryDirectory(
@@ -856,6 +963,7 @@ def chunk_step(
                     Path(temporary_dir),
                     stem,
                     max_bytes,
+                    max_pages=max_pages,
                 )
                 chunk_paths = _commit_precise_chunks(
                     chunks,
@@ -897,7 +1005,10 @@ def chunk_step(
         print(f"\n  \u26a0\ufe0f  {stats['still_over']} file(s) could not be chunked below {max_mb} MB.")
         print("     The original files were preserved for manual review.")
     else:
-        print(f"\n  \u2705 All chunks are under {max_mb} MB.")
+        print(
+            f"\n  \u2705 All chunks are under {max_mb} MB "
+            f"and contain at most {max_pages} pages."
+        )
 
     return stats
 
@@ -961,6 +1072,7 @@ def run_tender_pipeline(
     jpeg_quality=80,
     dpi_threshold: int | None = None,
     max_mb=50.0,
+    max_pages: int = 500,
     output_folder: str | None = None,
     pdf_only: bool = False,
     silent: bool = False,
@@ -983,6 +1095,8 @@ def run_tender_pipeline(
         raise ValueError("--dpi-threshold must be greater than --dpi")
     if max_mb <= 0:
         raise ValueError("--max-mb must be positive")
+    if max_pages < 1:
+        raise ValueError("--max-pages must be at least 1")
     if workers is not None and workers < 1:
         raise ValueError("--workers must be at least 1")
 
@@ -999,6 +1113,10 @@ def run_tender_pipeline(
     print("==================================================================")
     print(f"\U0001f680 STARTING TENDER DOCUMENT PIPELINE FOR: {source_root.name}")
     print("==================================================================")
+    print(
+        f"\u26a0\ufe0f Output limits: strictly under {max_mb} MB and at most "
+        f"{max_pages} pages per PDF. Files over {max_pages} pages will be chunked."
+    )
 
     if pdf_only:
         print("\n--- STEP 1: SKIPPED (--pdf-only: compressing existing PDFs directly) ---")
@@ -1025,7 +1143,7 @@ def run_tender_pipeline(
     compress_stats = compress_step(
         converted_root, compressed_root, target_dpi=target_dpi, jpeg_quality=jpeg_quality,
         max_mb=max_mb, skip_copy=skip_copy, quiet=quiet, skip_compression=skip_compression,
-        dpi_threshold=dpi_threshold, workers=workers,
+        dpi_threshold=dpi_threshold, workers=workers, max_pages=max_pages,
     )
 
     print("\n--- STEP 3: VALIDATING FINAL FILE SIZES ---")
@@ -1037,9 +1155,15 @@ def run_tender_pipeline(
         # Validate the source files directly instead.
         print("  \u2139\ufe0f --skip-copy: no files in output folder. Validating source files directly.")
         source_pdfs = [f for f in converted_root.rglob("*.pdf") if not f.name.startswith("~$")]
-        passed, validate_stats = validate_step(converted_root, max_mb=max_mb, pdf_files=source_pdfs, quiet=quiet)
+        passed, validate_stats = validate_step(
+            converted_root, max_mb=max_mb, max_pages=max_pages,
+            pdf_files=source_pdfs, quiet=quiet,
+        )
     else:
-        passed, validate_stats = validate_step(compressed_root, max_mb=max_mb, pdf_files=output_pdfs, quiet=quiet)
+        passed, validate_stats = validate_step(
+            compressed_root, max_mb=max_mb, max_pages=max_pages,
+            pdf_files=output_pdfs, quiet=quiet,
+        )
 
     # --- STEP 3b: EXACT SIZE CHUNKING ---
     # If files are still over the limit after compression, offer to chunk them.
@@ -1051,8 +1175,11 @@ def run_tender_pipeline(
         proceed = silent  # auto-proceed in silent mode
 
         if not silent:
-            print(f"\n  {len(overlimit)} file(s) are over the {max_mb} MB limit.")
-            print("  Chunking can split them once using exact serialized byte sizes.")
+            print(
+                f"\n  {len(overlimit)} file(s) exceed the size or "
+                f"{max_pages}-page limit."
+            )
+            print("  Chunking can split them to satisfy both limits.")
             try:
                 answer = input("\n  Proceed with chunking? [y/N] ").strip().lower()
                 proceed = answer in ("y", "yes")
@@ -1063,16 +1190,23 @@ def run_tender_pipeline(
             chunk_stats = chunk_step(
                 overlimit, compressed_root, max_mb,
                 source_root=source_root if skip_copy else None,
+                max_pages=max_pages,
             )
 
             # Re-validate after chunking.
             print("\n--- STEP 3b: RE-VALIDATING AFTER CHUNKING ---")
             output_pdfs = [f for f in compressed_root.rglob("*.pdf") if not f.name.startswith("~$")]
-            passed, validate_stats = validate_step(compressed_root, max_mb=max_mb, pdf_files=output_pdfs, quiet=quiet)
+            passed, validate_stats = validate_step(
+                compressed_root, max_mb=max_mb, max_pages=max_pages,
+                pdf_files=output_pdfs, quiet=quiet,
+            )
         else:
             print("\n  \u23ed\ufe0f Chunking skipped.")
 
-    print_summary(compress_stats, validate_stats, max_mb, chunk_stats=chunk_stats)
+    print_summary(
+        compress_stats, validate_stats, max_mb,
+        max_pages=max_pages, chunk_stats=chunk_stats,
+    )
 
     chunked_count = chunk_stats["chunked"] if chunk_stats else 0
     if skip_copy:
@@ -1145,6 +1279,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max-mb", type=float, default=50.0, help="Max allowed file size in MB")
     parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=500,
+        help="Maximum pages allowed per output PDF (default: 500)",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=None,
@@ -1176,6 +1316,7 @@ if __name__ == "__main__":
         jpeg_quality=args.quality,
         dpi_threshold=args.dpi_threshold,
         max_mb=args.max_mb,
+        max_pages=args.max_pages,
         output_folder=args.output,
         pdf_only=args.pdf_only,
         silent=args.silent,
