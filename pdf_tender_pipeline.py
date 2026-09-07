@@ -60,7 +60,16 @@ from PIL import Image
 
 # File extensions LibreOffice will convert to PDF
 WORD_EXTENSIONS = ("*.doc", "*.docx")
-_PIPELINE_TEMP_DIR_MARKERS = ("_compress_", "_chunks_", ".run_", ".backup_")
+_COMPRESSION_TEMP_MARKER = "_compress_"
+_CHUNK_TEMP_MARKER = "_chunks_"
+_RUN_TEMP_MARKER = ".run_"
+_BACKUP_TEMP_MARKER = ".backup_"
+_PIPELINE_TEMP_DIR_MARKERS = (
+    _COMPRESSION_TEMP_MARKER,
+    _CHUNK_TEMP_MARKER,
+    _RUN_TEMP_MARKER,
+    _BACKUP_TEMP_MARKER,
+)
 
 
 def _is_pipeline_temp_dir_name(name: str) -> bool:
@@ -198,7 +207,7 @@ def compress_single_pdf(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(
-        prefix=f".{output_path.stem}_compress_",
+        prefix=f".{output_path.stem}{_COMPRESSION_TEMP_MARKER}",
         dir=output_path.parent,
     ) as temporary_dir:
         stage_dir = Path(temporary_dir)
@@ -811,20 +820,49 @@ def _stage_precise_chunks(
         while start_page < total_pages:
             end_page = start_page
             accepted_bytes = None
+            maximum_end_page = min(start_page + max_pages, total_pages)
+            failed_end_page = None
+            probe_end_page = start_page + 1
 
-            while (
-                end_page < total_pages
-                and end_page - start_page < max_pages
-            ):
+            # Exponentially bracket the size boundary without first creating a
+            # potentially huge max-pages candidate.
+            while probe_end_page <= maximum_end_page:
                 candidate_bytes = _serialize_pdf_range(
                     doc,
                     start_page,
-                    end_page + 1,
+                    probe_end_page,
                 )
                 if len(candidate_bytes) >= max_bytes:
+                    failed_end_page = probe_end_page
                     break
                 accepted_bytes = candidate_bytes
-                end_page += 1
+                end_page = probe_end_page
+                if end_page == maximum_end_page:
+                    break
+                accepted_page_count = end_page - start_page
+                probe_end_page = min(
+                    start_page + accepted_page_count * 2,
+                    maximum_end_page,
+                )
+
+            # Find the largest exact serialized range between the last passing
+            # probe and the first failing probe.
+            if accepted_bytes is not None and failed_end_page is not None:
+                low_end_page = end_page + 1
+                high_end_page = failed_end_page - 1
+                while low_end_page <= high_end_page:
+                    probe_end_page = (low_end_page + high_end_page) // 2
+                    candidate_bytes = _serialize_pdf_range(
+                        doc,
+                        start_page,
+                        probe_end_page,
+                    )
+                    if len(candidate_bytes) < max_bytes:
+                        accepted_bytes = candidate_bytes
+                        end_page = probe_end_page
+                        low_end_page = probe_end_page + 1
+                    else:
+                        high_end_page = probe_end_page - 1
 
             rescued = False
             rescue_settings = None
@@ -985,7 +1023,7 @@ def chunk_step(
 
         try:
             with tempfile.TemporaryDirectory(
-                prefix=f".{stem}_chunks_",
+                prefix=f".{stem}{_CHUNK_TEMP_MARKER}",
                 dir=output_dir,
             ) as temporary_dir:
                 chunks = _stage_precise_chunks(
@@ -1074,7 +1112,9 @@ def resolve_output_root(source_root: Path, output_arg: str | None, suffix: str) 
 def _publish_output_tree(staged_root: Path, final_root: Path) -> None:
     """Publishes a completed output tree while preserving the prior tree on failure."""
     final_root.parent.mkdir(parents=True, exist_ok=True)
-    backup_root = final_root.parent / f".{final_root.name}.backup_{os.getpid()}"
+    backup_root = final_root.parent / (
+        f".{final_root.name}{_BACKUP_TEMP_MARKER}{os.getpid()}"
+    )
     if backup_root.exists():
         raise FileExistsError(f"stale output backup exists: {backup_root}")
 
@@ -1133,7 +1173,7 @@ def run_tender_pipeline(
     final_output_root = resolve_output_root(source_root, output_folder, "compressed")
     final_output_root.parent.mkdir(parents=True, exist_ok=True)
     run_root = Path(tempfile.mkdtemp(
-        prefix=f".{final_output_root.name}.run_",
+        prefix=f".{final_output_root.name}{_RUN_TEMP_MARKER}",
         dir=final_output_root.parent,
     ))
     converted_root = run_root / "all-pdfs"
