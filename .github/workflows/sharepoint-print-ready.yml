@@ -1,0 +1,53 @@
+name: Build print-ready SharePoint documentation
+
+on:
+  workflow_dispatch:
+    inputs:
+      copilot_billing:
+        description: Copilot billing route
+        required: true
+        type: choice
+        options:
+          - organization
+          - personal
+        default: organization
+
+permissions:
+  contents: read
+  copilot-requests: write
+
+concurrency:
+  group: sharepoint-print-ready-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-print-ready-documents:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out documentation
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create paginated HTML and A4 PDFs
+        id: print
+        uses: willlau-GRP/documentation-pipeline-sharepoint@809c1b77c8b3d494c41142ef47e2adef32d1d877
+        with:
+          project-name: TenderConversion
+          source-root: docs/sharepoint
+          output-root: ${{ runner.temp }}/sharepoint-print-ready
+          billing-mode: ${{ inputs.copilot_billing }}
+          github-token: ${{ github.token }}
+          copilot-token: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          model: gpt-5.6-luna
+          reasoning-effort: xhigh
+
+      - name: Save print-ready documents
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: TenderConversion-sharepoint-print-ready
+          path: ${{ runner.temp }}/sharepoint-print-ready
+          if-no-files-found: warn
+          retention-days: 7
