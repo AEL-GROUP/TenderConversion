@@ -4,17 +4,17 @@
 **文件狀態：** 現行版本
 **最後審核：** 2026-10-05
 
-> 備註：以下 LibreOffice CLI 呼叫細節與子程序處置機制於 2026 年 10 月 05 日審核此文檔時仍然有效。
+> 備註：以下 LibreOffice 命令列呼叫方式與子程序處理，於 2026 年 10 月 05 日審閱本文件時仍然適用。
 
 ---
 
 ## 簡要說明 (Summary)
 
-本筆記記錄 `pdf_tender_pipeline.py` 在 `STEP 1` 中調用 **LibreOffice Headless Mode** 進行大量 `.doc` 與 `.docx` 轉檔時的實作考量、例外處理機制、以及與微軟原生 Office 轉檔相較之下的架構取捨。
+本筆記說明 `pdf_tender_pipeline.py` 在 `STEP 1` 使用 **LibreOffice Headless Mode** 將 `.doc` 與 `.docx` 轉換為 PDF 時的實作方式、例外處理及設計考量。
 
 ---
 
-## 核心調用實作剖析 (Core Implementation)
+## 核心呼叫方式 (Core Implementation)
 
 在 `pdf_tender_pipeline.py` 中，轉換 Word 檔案的核心函式如下：
 
@@ -52,17 +52,17 @@ except subprocess.CalledProcessError as e:
 
 ## 關鍵技術要點與踩坑記錄 (Key Insights & Gotchas)
 
-### 1. 為什麼採用 headless LibreOffice 而非 python-docx / docx2pdf？
-- **跨平台與免微軟 Office 授權：** `docx2pdf` 在後台依賴 Windows 的 COM 物件（Win32 COM Automation）啟動微軟 Word，在 Linux 伺服器與 Docker 容器中完全無法運作。
-- **舊版格式支援：** 許多歷史投標檔案為二進位二進制檔案 `.doc`（Word 97-2003 格式），純 Python 函式庫（如 `python-docx`）完全無法讀取 `.doc`，而 LibreOffice 具備深厚的向下相容解析能力。
-- **向量與複雜排版渲染：** 投標規範書包含複雜的頁首頁尾、目錄階層、嵌入表格與雙欄編排，LibreOffice 的排版渲染引擎成熟度遠高於簡易輕量開源套件。
+### 1. 為什麼使用 headless LibreOffice？
+- **可在容器環境執行：** 無周邊模式不需要圖形介面，適合在伺服器或 Docker 容器中執行。
+- **支援舊版 `.doc` 格式：** LibreOffice 可處理舊版 Word 文件；僅支援 `.docx` 的 Python 套件則無法涵蓋此格式。
+- **處理複雜版面：** Word 文件可能包含頁首頁尾、表格及多欄排版；轉換結果仍應抽樣檢查，以確認版面符合需求。
 
-### 2. 子程序異常與假性成功防禦 (False Positive Defense)
-- **現象：** LibreOffice 在極端損毀的 Word 檔案上，有時回傳 Exit Code `0`，但實際上並未在輸出目錄產生目標 `.pdf`。
-- **管道防禦機制：** 管道不單純相信子程序的結束狀態碼，而是在子程序結束後強制執行 `if expected_output.exists():` 檔案實體確認，確保下游步驟不會因缺失檔案而拋出空指標例外。
+### 2. 檢查轉換輸出是否存在
+- **可能情況：** 即使 LibreOffice 程序回傳成功狀態，輸出資料夾中仍可能沒有預期的 PDF。
+- **管道處理方式：** 子程序結束後，管道會檢查 `expected_output.exists()`，確認預期輸出檔案確實存在，再繼續後續處理。
 
-### 3. 字型代換與頁碼變動保護
-- 在轉檔過程中，若來源 Word 所使用之字型在主機環境不存在，LibreOffice 會自動啟用字型代換。本專案之 Docker 映像檔預先安裝 `fonts-liberation`，其字元寬度與微軟 Arial / Times New Roman 完全公制一致，大幅避免了因字型代換導致段落換行、進而引發整份文件頁碼錯位的問題。
+### 3. 字型替代與版面差異
+- 若來源 Word 使用的字型未安裝於執行環境，LibreOffice 可能以其他字型替代。Docker 映像檔包含 `fonts-liberation`，但仍建議檢查轉換後的換行、頁數及版面，尤其是使用特殊字型的文件。
 
 ---
 

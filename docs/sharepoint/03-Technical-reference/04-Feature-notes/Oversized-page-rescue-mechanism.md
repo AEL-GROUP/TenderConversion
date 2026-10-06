@@ -4,24 +4,24 @@
 **文件狀態：** 現行版本  
 **最後審核：** 2026-10-05  
 
-> 備註：以下分析直接對比 `pdf_tender_pipeline.py` 原始碼實作，於 2026 年 10 月 05 日查核時 100% 一致。
+> 備註：以下說明依據 `pdf_tender_pipeline.py` 的實作整理，並於 2026 年 10 月 05 日核對。
 
 ---
 
 ## 簡要說明 (Summary)
 
-本筆記深度解析 `pdf_tender_pipeline.py` 原始碼中之 `_rescue_oversized_page` 與 `_stage_precise_chunks` 救援架構。在工程圖紙（如 A0 全區管線配置圖、高精細地圖）的處理過程中，偶爾會遇到「單一頁面」序列化後體積即超越 **Google Cloud 50.0 MB** 限制的極端狀況。本文件逐行比對真實程式碼，說明系統如何精確觸發、階梯式降階彩現、封裝單頁分塊、並在極限失敗時提供無損復原與備份退避。
+本筆記說明 `pdf_tender_pipeline.py` 中 `_rescue_oversized_page` 與 `_stage_precise_chunks` 的處理流程。當單一頁面序列化後仍超過設定的大小上限時，頁面無法再依頁數切分；此時管道會依序嘗試不同的點陣化設定，並將成功處理的頁面輸出為獨立分塊。若所有設定都無法符合大小上限，管道會回報錯誤並保留原始檔案以供檢查。
 
 ---
 
 ## 程式碼執行路徑與觸發條件 (Code Execution & Trigger Path)
 
-### 1. 觸發生命週期位置
-- **非 Step 2 壓縮階段：** 常規壓縮階段（`compress_single_pdf`）**絕對不會**觸發全頁點陣化救援，以確保原生文字向量層 100% 完整。
-- **純屬 Step 3b 分塊階段：** 救援機制僅在 `chunk_step` -> `_stage_precise_chunks` 迴圈中被調用。
+### 1. 觸發時機
+- **不在 Step 2 壓縮階段執行：** 一般壓縮函式 `compress_single_pdf` 不會呼叫此單頁點陣化救援流程。
+- **只在 Step 3b 分塊階段執行：** `chunk_step` 呼叫 `_stage_precise_chunks` 時，若單頁無法放入目前分塊，才會進入救援判斷。
 
 ### 2. 精確觸發邏輯 (`_stage_precise_chunks`)
-在分塊迴圈中，系統以指數倍增探測可容納的頁面範圍：
+分塊迴圈會以指數倍增方式探測可容納的頁面範圍：
 
 ```python
 # 截自 pdf_tender_pipeline.py (約第 820-870 行)
@@ -43,10 +43,10 @@ while start_page < total_pages:
         ...
 ```
 
-- **觸發判斷點：** 當連第一頁 `probe_end_page = start_page + 1` 序列化後的 `len(candidate_bytes)` 都大於或等於 `max_bytes`（50 MB）時：
-  1. 迴圈立即 `break`，此時 `accepted_bytes` 依然為 `None`。
-  2. 隨後的二分搜尋區間因 `accepted_bytes is None` 直接跳過。
-  3. 進入救援判定分支：
+- **觸發條件：** 若第一個單頁候選範圍 `start_page` 至 `start_page + 1` 的序列化大小大於或等於 `max_bytes`：
+  1. 探測迴圈會立即結束，此時 `accepted_bytes` 仍為 `None`。
+  2. 由於沒有可接受的候選分塊，二分搜尋會略過。
+  3. 流程接著進入單頁救援判斷：
      ```python
      if accepted_bytes is None:
          rescue_result = _rescue_oversized_page(doc, start_page, max_bytes)
@@ -63,7 +63,7 @@ while start_page < total_pages:
 
 ## 救援演算法核心實作剖析 (`_rescue_oversized_page`)
 
-完整實作如下（`pdf_tender_pipeline.py` 第 754-802 行）：
+以下程式碼摘錄自 `_rescue_oversized_page`（原始碼約第 754 至 802 行）：
 
 ```python
 def _rescue_oversized_page(doc, page_index: int, max_bytes: float):
@@ -111,22 +111,21 @@ def _rescue_oversized_page(doc, page_index: int, max_bytes: float):
 ```
 
 ### 關鍵工程細節：
-1. **6 階遞降梯隊 (Progressive 6-Step Ladder)：**
-   - 依序嘗試：`(180, 75)` -> `(150, 70)` -> `(120, 60)` -> `(96, 50)` -> `(72, 40)` -> `(50, 30)`。
-   - 優先以最高可能清晰度（180 DPI / Q=75）嘗試，一旦滿足 `< max_bytes` 立即提前終止，絕不過度壓縮。
-2. **色彩空間降維 (`pymupdf.csGRAY`)：**
-   - 將 RGB 3 通道降為單通道灰階，瞬間消除 66% 未壓縮記憶體開銷。
-   - 關閉 Alpha 透明通道（`alpha=False`），杜絕 RGBA 帶來的冗餘圖層資料。
-3. **單頁獨立分塊（Isolated Single-Page Chunk）：**
-   - 成功救援的頁面，`end_page` 必定強制設定為 `start_page + 1`。
-   - 該頁面會被**單獨封裝**為獨立的 `_chunk-N.pdf`，絕不會與前後頁面合併。
-   - 隨後 `start_page` 推進至下一頁，繼續回歸常規貪婪演算法。
+1. **依序嘗試六組設定：**
+   - 順序為 `(180, 75)`、`(150, 70)`、`(120, 60)`、`(96, 50)`、`(72, 40)`、`(50, 30)`，數值分別代表 DPI 與 JPEG 品質。
+   - 每次都先嘗試較高的解析度與品質；候選檔小於 `max_bytes` 時即停止嘗試。
+2. **轉為灰階影像 (`pymupdf.csGRAY`)：**
+   - 彩現時使用灰階色彩空間，並以 `alpha=False` 關閉 Alpha 通道。
+   - PIL 影像使用 `L` 模式，再以 JPEG 格式儲存。
+3. **將救援頁面獨立輸出：**
+   - 救援成功後，`end_page` 設為 `start_page + 1`，因此該頁會成為單頁分塊，不會與前後頁合併。
+   - 處理完成後，管道會從下一頁繼續進行一般分塊。
 
 ---
 
-## 救援成功時之日誌與統計輸出 (Success Reporting)
+## 救援成功時的日誌與統計 (Success Reporting)
 
-當某一頁面被救援成功時，系統會紀錄元數據並輸出終端提示：
+救援成功時，管道會在終端輸出分塊頁碼、檔案大小及採用的 DPI 與 JPEG 品質：
 
 ```text
 # 終端機即時輸出 (Console Output)
@@ -136,13 +135,13 @@ def _rescue_oversized_page(doc, page_index: int, max_bytes: float):
    • Produced: Drawings_A0_chunk-3.pdf (pp. 4-10, 41.50 MB)
 ```
 
-- **統計指標：** 摘要報告中 `Oversized pages rescued` 計數器增加 1。
+- **統計資訊：** 摘要報告中的 `Oversized pages rescued` 計數器會增加 1。
 
 ---
 
 ## 全階梯皆失敗時的退避與事務保護 (Failure Fallback & Rollback)
 
-若某單一頁面即使降至最低階 `(50 DPI, Q=30)` 依然 `>= max_bytes`（例如畫布尺寸極為巨大）：
+若單頁採用最低設定 `(50 DPI, Q=30)` 後仍大於或等於 `max_bytes`：
 
 ```mermaid
 flowchart TD
@@ -154,31 +153,31 @@ flowchart TD
     PreserveOrig & Rollback --> NextFile[不中斷程序，繼續處理下一份超標檔案]
 ```
 
-### 原始碼行為保證：
-1. **絕不中斷整個批次：** `chunk_step` 會攔截例外，印出 `❌ Failed to chunk <file>: <error>`，並將該檔案計入 `still_over`。
-2. **來源檔案安全備份（Zero Data Loss）：**
+### 錯誤處理流程
+1. **回報該檔案處理失敗：** `chunk_step` 會捕捉例外，輸出 `❌ Failed to chunk <file>: <error>`，並將該檔案計入 `still_over`。
+2. **保留原始檔案：**
    ```python
    # 若輸出目錄中未有該檔案，強制自來源複製原始檔案，確保檔案不遺失
    if not output_pdf.exists() and pdf_path != output_pdf:
        shutil.copy2(pdf_path, output_pdf)
    ```
-3. **終端警告提示：**
+3. **顯示摘要警告：**
    執行結束時印出：
    `⚠️ 1 file(s) could not be chunked below 50.0 MB. The original files were preserved for manual review.`
-4. **交易性回滾（`_commit_precise_chunks`）：**
-   若暫存切分在替換途中拋出異常，備份目錄中的既有分塊會逆序原樣復原，絕不留下半殘的檔案。
+4. **回復既有分塊（`_commit_precise_chunks`）：**
+   若提交暫存分塊時發生錯誤，管道會從備份目錄復原既有分塊，避免留下不完整的替換結果。
 
 ---
 
 ## 維運處置標準作業程序 (Operator Action SOP)
 
-當日誌出現單頁救援失敗時，維運人員應採取以下處置：
+若日誌顯示單頁救援失敗，維運人員可依下列步驟處理：
 
-1. **查閱日誌定位頁碼：** 從日誌中找出具體失敗頁數（如 `page 4 cannot be reduced below the size limit`）。
-2. **人工審閱該頁內容：** 在原始 CAD 或設計軟體中檢視該頁，通常為包含海量圖層的未平整化向量地圖。
-3. **改善處置方案：**
-   - 方案 A（推薦）：在 CAD 轉存時降低點陣底圖解析度，或隱藏無關之密集網格圖層。
-   - 方案 B：將該圖紙切分為多張局部圖（Tiles）後重新輸入管線。
+1. **確認頁碼：** 從錯誤訊息找出無法處理的頁面，例如 `page 4 cannot be reduced below the size limit`。
+2. **檢查來源頁面：** 使用適當的 PDF、CAD 或設計工具檢視原始內容，確認該頁是否包含複雜圖層或大型影像。
+3. **評估處理方式：**
+   - 方案 A：從 CAD 重新輸出時降低點陣底圖解析度，或移除不需要的密集圖層。
+   - 方案 B：將圖紙拆分為多張局部圖後，再重新交由管線處理。
 
 ---
 

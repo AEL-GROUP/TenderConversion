@@ -4,21 +4,21 @@
 **文件狀態：** 現行版本
 **最後審核：** 2026-10-05
 
-> 備註：以下 Docker 容器設定與參數指令於 2026 年 10 月 05 日審核此文檔時仍然有效。
+> 備註：以下 Docker 設定與參數指令，於 2026 年 10 月 05 日審閱本文件時仍然有效。
 
 ---
 
 ## 簡要說明 (Summary)
 
-本手冊提供執行投標文檔轉換核心管道（`pdf_tender_pipeline.py`）的標準指南。透過預先打包好的 Docker 映像檔，維運人員無需在本機配置複雜的 Python 3.12、LibreOffice 或字型環境，即可一鍵將招標 Word 檔高保真轉為 PDF、實施無損重整、DPI 圖像降採樣、並依據 **Google Cloud 50MB 與 500 頁限制** 實施精確分塊。
+本手冊說明如何執行投標文件轉換管道（`pdf_tender_pipeline.py`）。使用 Docker 映像檔可避免在本機分別安裝 Python、LibreOffice 及字型相依項目，並批次執行 Word 轉 PDF、PDF 重整、圖像降採樣及文件分塊。大小與頁數門檻由 `--max-mb` 和 `--max-pages` 參數控制。
 
 ---
 
 ## 對使用者或營運的影響 (Impact on Users & Operations)
 
-- **開箱即用與零環境依賴：** 封裝 headless LibreOffice 與完整中英文字型，徹底解決不同作業系統（Windows / macOS / Linux）字型缺失導致轉檔排版錯位之問題。
-- **保證輸出合規：** 產出的所有 PDF 檔案百分之百保證小於 50.0 MB 且不超過 500 頁，可直接同步進入 Google Cloud Storage 供 RAG Agent 索引。
-- **事務性安全機制：** 管道採暫存目錄雙重驗證後置換（Transactional Replacement），即使中途被強制中斷，亦不會破壞或污染原始來源目錄。
+- **簡化環境準備：** Docker 映像檔包含 headless LibreOffice 與所需字型，減少不同主機環境造成的差異。
+- **依參數控制輸出規格：** 管道會檢查檔案大小與頁數，並依設定進行分塊；無法處理的例外會記錄於執行結果中。
+- **降低處理中斷的影響：** 管道先寫入暫存位置，驗證後再置換輸出檔案，避免未完成的結果直接覆蓋已存在的檔案。
 
 ---
 
@@ -43,21 +43,21 @@ TenderConversion/
 
 ### 2. 標準執行指令 (Standard Execution Command)
 
-打開 PowerShell 或 Bash終端機，執行以下指令：
+開啟 PowerShell 或 Bash 終端機，執行以下命令：
 
 ```powershell
 docker compose run --rm tender-pipeline -i /data/MyTender_Input -o /data/MyTender_Final
 ```
 
-執行過程中，管道將依序執行以下 5 個步驟：
-1. **STEP 1: Word 轉 PDF：** 自動調用 LibreOffice 將所有 `.doc` 與 `.docx` 轉為對應結構的 `.pdf`。
-2. **STEP 2: PDF 壓縮最佳化：** 對大於 50MB 之 PDF 實施物件重整與圖像 200 DPI 降採樣；小於 50MB 者直接快速複製。
-3. **STEP 3: 規格合規驗證：** 逐一檢查所有 PDF 檔案之大小與頁數。
-4. **STEP 3b: 嚴格分塊 (Exact Size Chunking)：** 超過 50MB 或 500 頁之文件，自動切分為符合規格之 `_chunk-1.pdf`, `_chunk-2.pdf`。
-5. **STEP 4 & 5: 摘要報告與檔案完整性斷言：** 列印空間節省率與分塊總數，確保檔案未遺漏。
+執行時，管道會依序進行以下處理：
+1. **STEP 1: Word 轉 PDF：** 使用 LibreOffice 將 `.doc` 與 `.docx` 轉成 PDF，並保留來源目錄結構。
+2. **STEP 2: PDF 壓縮與最佳化：** 依參數處理 PDF 物件與高解析度圖像；已符合大小限制的檔案則依管道設定複製。
+3. **STEP 3: 規格檢查：** 逐一檢查 PDF 的檔案大小與頁數。
+4. **STEP 3b: 精確分塊 (Exact Size Chunking)：** 超出 `--max-mb` 或 `--max-pages` 設定的文件會嘗試切分為 `_chunk-1.pdf`、`_chunk-2.pdf` 等檔案。
+5. **STEP 4 & 5: 摘要報告與檔案完整性檢查：** 顯示處理統計，並檢查輸出檔案數量。
 
 ### 3. 收集成果 (Collect Output)
-處理完成後，所有符合 RAG 規範的文件將自動輸出於本機 `data/MyTender_Final/`，原始目錄結構維持不變。
+處理完成後，輸出文件會存放在本機 `data/MyTender_Final/`，並保留來源目錄結構。
 
 ---
 
@@ -66,32 +66,32 @@ docker compose run --rm tender-pipeline -i /data/MyTender_Input -o /data/MyTende
 管道支援豐富的命令列參數，可針對不同工作場景進行彈性切換：
 
 ### 場景 1：輸入目錄全為 PDF（無 Word 檔）
-加上 `--pdf-only` 跳過 Word 偵測與 LibreOffice 初始化，大幅提升處理速度：
+加上 `--pdf-only` 可略過 Word 轉檔步驟：
 ```powershell
 docker compose run --rm tender-pipeline -i /data/MyTender_PDFs --pdf-only -o /data/MyTender_Final
 ```
 
 ### 場景 2：數千份檔案的快速批次模式（WSL / 共享網路磁碟專用）
-若來源目錄有大量已小於 50MB 的合規檔案，加上 `--skip-copy` 可避免重複複製未超標檔案，僅針對超標檔案輸出分塊，大幅降低 I/O 等待時間：
+若來源目錄含有大量已符合限制的檔案，可加上 `--skip-copy` 略過這些檔案的複製，只將需要處理的超標檔案輸出，以減少磁碟 I/O：
 ```powershell
 docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --skip-copy --quiet --silent -o /data/MyTender_Final
 ```
-> **注意：** 使用 `--skip-copy` 時，輸出資料夾僅包含被壓縮或分塊的文件，未超標文件保留在來源目錄中。
+> **注意：** 使用 `--skip-copy` 時，輸出資料夾只會包含經壓縮或分塊處理的文件；已符合限制的文件仍留在來源目錄。
 
 ### 場景 3：CI/CD 自動化批次執行（非交談模式）
-在無人看守的排程工作或 CI/CD 流水線中，務必加上 `--silent`，當遇到超標檔案時自動分塊，不需等待使用者在終端機輸入確認：
+在無人看守的排程或 CI/CD 流程中，可使用 `--silent` 自動繼續分塊，不必等待終端機輸入確認：
 ```powershell
 docker compose run --rm tender-pipeline -i /data/MyTender --silent -o /data/MyTender_Final
 ```
 
 ### 場景 4：僅驗證與分塊，完全不做圖像重編碼
-若確認所有 PDF 的圖紙均已調適完成，僅需針對超長或超大頁數切分：
+若不需要重新編碼圖像，只想檢查規格並切分超限文件，可使用以下命令：
 ```powershell
 docker compose run --rm tender-pipeline -i /data/MyTender --pdf-only --skip-compression --silent -o /data/MyTender_Final
 ```
 
 ### 場景 5：高解析度工程圖紙模式（更高 OCR 精確度）
-對於細小工程文字標註為主的圖紙，可將目標 DPI 提升至 300，JPEG 品質設為 85：
+若圖紙包含細小文字標註，可將目標 DPI 設為 300，並將 JPEG 品質設為 85：
 ```powershell
 docker compose run --rm tender-pipeline -i /data/MyTender -o /data/MyTender_Final --dpi 300 -q 85 --max-mb 50.0
 ```
@@ -106,14 +106,14 @@ docker compose run --rm tender-pipeline -i /data/MyTender -o /data/MyTender_Fina
 | `-o`, `--output` | `<source> compressed` | 輸出目標目錄路徑。 |
 | `--max-mb` | `50.0` | 嚴格單檔體積上限 (MB)。預設 50.0 MB 符合 GCloud Agent Platform 限制。 |
 | `--max-pages` | `500` | 嚴格單檔頁數上限。預設 500 頁符合 Document AI 解析上限。 |
-| `--dpi` | `200` | 圖像重編碼之目標解析度。建議 200~300 DPI。 |
+| `--dpi` | `200` | 圖像重編碼的目標解析度；請依文件內容檢查輸出效果。 |
 | `--dpi-threshold`| `1.5 x --dpi` | 觸發降採樣的有效 DPI 門檻（必須大於 `--dpi`）。 |
-| `-q`, `--quality` | `80` | JPEG 壓縮品質係數（1~100）。80 為視覺品質與體積的最佳平衡。 |
+| `-q`, `--quality` | `80` | JPEG 壓縮品質係數（1~100）。請抽查輸出圖像是否清晰。 |
 | `--workers` | `2` | 並行壓縮程序數。高核心數機器可適度調大，但需留意記憶體上限。 |
 | `--pdf-only` | `關閉` | 跳過 Word 轉 PDF 步驟，直接對既有 PDF 實施處理。 |
 | `--silent` | `關閉` | 自動執行分塊，無需交談式輸入確認（自動化排程必備）。 |
 | `--no-chunk` | `關閉` | 停用自動分塊功能。超標文件會被標記警告但不會切分。 |
-| `--skip-copy` | `關閉` | 不複製合規小檔案，僅輸出處理過之超標文件（適用於慢速檔案系統）。 |
+| `--skip-copy` | `關閉` | 略過符合限制檔案的複製，只輸出經處理的超標文件（適用於較慢的檔案系統）。 |
 | `--skip-compression` | `關閉` | 跳過圖像壓縮步驟，僅進行規格檢驗與切分。 |
 | `--quiet` | `關閉` | 簡潔輸出模式，僅顯示進度摘要與統計，隱藏逐檔 PASS 訊息。 |
 
@@ -121,7 +121,7 @@ docker compose run --rm tender-pipeline -i /data/MyTender -o /data/MyTender_Fina
 
 ## 本機無 Docker 執行方式 (Local Python Setup)
 
-若環境未安裝 Docker，可於本機 Python 環境直接執行：
+若未使用 Docker，也可以在已安裝必要相依項目的本機 Python 環境執行：
 
 ### 前置需求
 1. Python 3.12 以上。
@@ -139,8 +139,8 @@ python pdf_tender_pipeline.py -i ./data/MyTender -o ./data/MyTender_Final --pdf-
 
 ## 已知限制或待確認項目 (Pending Confirmations & Limitations)
 
-- **待確認：** 企業生產環境的 Docker 主機規格（CPU 核心數與記憶體大小），以便決定 `--workers` 的最佳設定值（建議每 Worker 保留 2GB RAM）。
-- **限制：** LibreOffice 在 Windows 平台之執行路徑可能與 Linux 容器不同，強烈建議統一採用 Docker 方式執行以獲取最高的排版一致性。
+- **待確認：** 生產環境 Docker 主機的 CPU 與記憶體規格，據此調整 `--workers`。
+- **限制：** LibreOffice 在不同作業系統上的執行環境可能有所差異。若需統一執行環境，可使用 Docker；轉檔結果仍應抽樣檢查。
 
 ---
 

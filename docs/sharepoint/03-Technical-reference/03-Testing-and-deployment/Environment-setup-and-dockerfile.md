@@ -4,19 +4,19 @@
 **文件狀態：** 現行版本
 **最後審核：** 2026-10-05
 
-> 備註：以下容器化規範與建置參數於 2026 年 10 月 05 日審核此文檔時仍然有效。
+> 備註：以下容器化方式與建置參數，於 2026 年 10 月 05 日審閱本文件時仍然適用。
 
 ---
 
 ## 簡要說明 (Summary)
 
-本文件深入解構 `TenderConversion` 專案之 `Dockerfile`、`docker-compose.yml` 架構設計，以及系統字型相依性管理。詳細說明本專案如何打造輕量化、具備字型代換穩定性且環境完全隔離的投標文檔處理容器，為不同作業系統環境提供一致的轉檔成果。
+本文件說明 `TenderConversion` 專案的 `Dockerfile`、`docker-compose.yml` 及系統字型相依項目，並介紹如何使用容器執行投標文件處理管道。容器化有助於讓不同主機使用一致的執行環境；文件版面仍可能受來源字型及實際轉換結果影響。
 
 ---
 
 ## Dockerfile 架構解構 (Dockerfile Architecture)
 
-本專案使用官方輕量級 `python:3.12-slim` 作為基底映像檔，並實施分層快取（Layer Caching）最佳化：
+本專案以 `python:3.12-slim` 作為基底映像檔，並將安裝相依套件與複製應用程式程式碼分開，以利重用建置快取：
 
 ```dockerfile
 # syntax=docker/dockerfile:1
@@ -49,15 +49,15 @@ ENTRYPOINT ["python3", "pdf_tender_pipeline.py"]
 CMD ["-i", "/data/my_tender_docs", "--dpi", "200", "-q", "80", "--max-mb", "50.0"]
 ```
 
-### 設計亮點：
-1. **字型穩定性保證：** 安裝 `fonts-dejavu-core` 與 `fonts-liberation`，當原始 Word 檔案使用 Arial、Times New Roman 或 Helvetica 時，系統能無縫進行公制相容字型代換（Metric-compatible font substitution），避免版面文字溢出或頁數暴增。
-2. **輕量安全：** 使用 `--no-install-recommends` 並於建置完畢後清除 `/var/lib/apt/lists/*`，有效將最終映像檔體積控制在最小範圍，降低潛在漏洞風險。
+### 設定說明
+1. **字型相依項目：** 映像檔安裝 `fonts-dejavu-core` 與 `fonts-liberation`，供容器中的 LibreOffice 使用。來源文件若使用未安裝的字型，仍可能出現字型替代及版面差異。
+2. **控制映像檔大小：** 建置時使用 `--no-install-recommends`，並在安裝後清除 `/var/lib/apt/lists/*`，避免保留不必要的套件索引資料。
 
 ---
 
 ## Docker Compose 磁碟掛載設計 (Volume Mount Strategy)
 
-在 `docker-compose.yml` 中，預設透過 Volume 將主機磁碟掛載至容器 `/data`：
+`docker-compose.yml` 預設會將主機的資料夾掛載至容器內的 `/data`：
 
 ```yaml
 services:
@@ -89,9 +89,9 @@ services:
       - "50.0"
 ```
 
-### 最佳實踐建議：
-- **容器臨時性（Ephemeral）：** 務必搭配 `--rm` 參數執行（`docker compose run --rm tender-pipeline ...`），在執行完畢後立即回收容器實例，避免累積龐大且未釋放的停止容器。
-- **寫入權限：** 容器以 root 身分執行於 `/app`，掛載的主機目錄在 Windows Docker Desktop 上會自動對應 NTFS 權限，無需額外執行 `chown`。
+### 使用建議
+- **執行後移除容器：** 使用 `--rm` 執行一次性工作，例如 `docker compose run --rm tender-pipeline ...`，讓容器在工作結束後自動移除。
+- **檢查掛載權限：** 請確認容器對掛載的主機目錄具有所需的讀寫權限；實際權限行為會因作業系統及 Docker 設定而異。
 
 ---
 

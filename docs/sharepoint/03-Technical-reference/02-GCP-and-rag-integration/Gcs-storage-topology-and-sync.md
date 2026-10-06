@@ -4,19 +4,19 @@
 **文件狀態：** 現行版本
 **最後審核：** 2026-10-05
 
-> 備註：以下 Google Cloud Storage (GCS) 設定規格與同步指令於 2026 年 10 月 05 日審核此文檔時仍然有效。
+> 備註：以下 GCS 目錄範例與同步指令，於 2026 年 10 月 05 日審閱本文件時仍然適用；實際 Bucket、路徑及同步方式待確認。
 
 ---
 
 ## 簡要說明 (Summary)
 
-本文件定義投標文檔經過 ETL 處理後，在 **Google Cloud Storage (GCS)** 上的標準儲存拓撲結構（Bucket Topology）、物件命名命名空間規範，以及如何運用 `gcloud storage rsync` 或 `gsutil` 執行安全、具冪等性（Idempotent）的批次資料同步，以無縫對接 Google Cloud Agent Enterprise Platform 的文件索引排程。
+本文件提供投標文件經 ETL 處理後存放於 **Google Cloud Storage（GCS）** 的目錄範例，以及使用 `gcloud storage rsync` 或 `gsutil` 進行批次同步的參考方式。文中的 Bucket 名稱與路徑均為示例，不代表本專案已採用特定 GCS 結構或平台索引流程；正式環境的設定仍待確認。
 
 ---
 
 ## GCS 儲存庫結構拓撲 (Bucket Directory Topology)
 
-為了讓下游的 Vertex AI Agent Builder 與 RAG Agent 能夠依據標案編號、冊別（Volume）進行精確的元數據過濾（Metadata / Facet Filtering），GCS 儲存庫必須維持嚴格的層級拓撲：
+以下為保留標案與冊別目錄結構的示例。實際 GCS 路徑及下游使用方式，應依專案部署設定確認：
 
 ```text
 gs://<PROJECT_ID>-tender-rag-corpus/                      # 核心知識庫儲存貯體 (Bucket Root)
@@ -35,51 +35,50 @@ gs://<PROJECT_ID>-tender-rag-corpus/                      # 核心知識庫儲�
     └── tender-2026-project-alpha/                        # 其他標案目錄...
 ```
 
-### 拓撲優勢
-1. **路徑語意對齊：** RAG Agent 在檢索到解答時，引用的 GCS URI 為 `gs://.../volume-01-contract/Contract_Conditions.pdf`，終端使用者一眼即可辨識解答出自合約分冊。
-2. **多租戶與專案隔離：** 不同標案以專屬 slug 隔離，便於單獨設定存取權限與生命週期原則。
+### 保留目錄結構的用途
+1. **方便辨識來源：** 以標案及冊別分類，可協助維護人員理解文件所在位置。
+2. **支援後續管理：** 不同標案可分別整理；是否另行設定存取權限或生命週期規則，須依實際環境規劃。
 
 ---
 
 ## 批次同步指令指引 (Synchronization Commands)
 
-當本機 `data/MyTender_Final` 產出合規文件後，工程師可使用 Google Cloud SDK 執行同步：
+若已確認本機輸出資料夾及 GCS 目的地，工程師可參考以下方式使用 Google Cloud SDK 執行同步：
 
 ### 推薦指令：使用現代 `gcloud storage rsync`
 ```powershell
-# 1. 啟用多執行緒快速增量同步
-gcloud storage rsync -r -d ./data/MyTender_Final gs://<PROJECT_ID>-tender-rag-corpus/tenders/<TENDER_SLUG>
+gcloud storage rsync -r ./data/MyTender_Final gs://<BUCKET_NAME>/<TENDER_PATH>
 ```
 
 ### 傳統指令：使用 `gsutil -m rsync`
 ```powershell
-gsutil -m rsync -r -d ./data/MyTender_Final gs://<PROJECT_ID>-tender-rag-corpus/tenders/<TENDER_SLUG>
+gsutil -m rsync -r ./data/MyTender_Final gs://<BUCKET_NAME>/<TENDER_PATH>
 ```
 
 ### 關鍵參數解說：
 - `-r` (Recursive)：遞迴同步所有子資料夾，確保分冊結構不被攤平。
-- `-d` (Delete)：（選用，請謹慎使用）若來源目錄中已刪除某些檔案，同步刪除 GCS 上的過時物件，避免 RAG 索引殘留舊版雜訊。
+- `-d` (Delete)：若來源目錄中已刪除某些檔案，會同步刪除 GCS 上的對應物件。此選項具有刪除效果；請先確認來源、目的地及刪除範圍，否則不要使用。
 - `-m` (Multi-threading)：並行上傳多個檔案，顯著縮短同步時間。
 
 ---
 
 ## 儲存類別與生命週期管理 (Storage Class & Lifecycle)
 
-為兼顧 RAG Agent 的檢索效能與企業儲存預算，建議在 GCS 儲存貯體上配置以下生命週期規則（Lifecycle Policy）：
+如需設定 GCS 儲存類別或生命週期規則，請由雲端管理人員依資料存取需求及保留政策評估。下表僅供規劃時參考：
 
 | 資料型態 | 建議儲存類別 (Storage Class) | 存取特性與考量 |
 |---|---|---|
-| **進行中標案 (Active Tenders)** | `Standard` (標準存儲) | 供 Agent Builder 建立索引與頻繁語意查詢，提供最低讀取延遲。 |
+| **進行中標案 (Active Tenders)** | `Standard`（標準儲存） | 適用於存取較頻繁的資料；實際選擇請依平台讀取需求評估。 |
 | **已截標/歷史標案 (> 180 天)** | `Nearline` | 查詢頻率降低，儲存費用減半，讀取延遲仍可接受。 |
-| **封存檔案 (> 365 天)** | `Coldline` 或 `Archive` | 供法務稽核備查，大幅壓縮長期存儲開銷。 |
+| **封存檔案 (> 365 天)** | `Coldline` 或 `Archive` | 適用於較少存取的資料；選用前請確認存取頻率及相關費用。 |
 
 ---
 
 ## 已知限制或待確認項目 (Pending Confirmations & Limitations)
 
 - **待確認：** 正式 Google Cloud 專案 ID（`<PROJECT_ID>`）與 GCS Bucket 正式名稱。
-- **待確認：** 是否已指派專用 Service Account（如 `sa-tender-rag-sync@<PROJECT_ID>.iam.gserviceaccount.com`）具備 `roles/storage.objectAdmin` 權限。
-- **限制：** GCS 單一目錄若包含超過 1,000,000 個物件時可能影響列舉速度，本專案依標案分冊管理，單一資料夾規模通常在數百至數千份，完全符合最佳架構規範。
+- **待確認：** 實際使用的同步身分及其所需 GCS 權限。
+- **待確認：** 目標 Bucket 的物件數量及目錄規模；請依實際用量評估管理方式。
 
 ---
 
